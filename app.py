@@ -1,6 +1,7 @@
 import os
 import json
 import base64
+import logging
 from flask import Flask, request, Response, jsonify
 
 from cryptography.hazmat.primitives.serialization import load_pem_private_key
@@ -9,6 +10,7 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 app = Flask(__name__)
+app.logger.setLevel(logging.INFO)
 
 # 🔐 RSA private key (sert uniquement à déchiffrer la clé AES envoyée par Meta)
 PRIVATE_KEY_PATH = os.getenv("PRIVATE_KEY_PATH", "private_key.pem")
@@ -25,6 +27,7 @@ def b64encode_bytes(b: bytes) -> str:
 
 
 def flip_iv(iv: bytes) -> bytes:
+    # IV inversé = XOR 0xFF sur chaque byte
     return bytes([x ^ 0xFF for x in iv])
 
 
@@ -42,6 +45,7 @@ def rsa_decrypt_aes_key(encrypted_aes_key_b64: str) -> bytes:
 
 
 def aes_gcm_decrypt(ciphertext_plus_tag: bytes, aes_key: bytes, iv: bytes) -> bytes:
+    # ciphertext_plus_tag = ciphertext || tag(16 bytes)
     if len(ciphertext_plus_tag) < 16:
         raise ValueError("Invalid encrypted_flow_data: too short")
 
@@ -88,40 +92,37 @@ def flow_endpoint():
         plaintext_bytes = aes_gcm_decrypt(encrypted_flow_data, aes_key, iv)
         incoming = json.loads(plaintext_bytes.decode("utf-8"))
 
-        # (Optionnel) log debug
         app.logger.info("Incoming flow payload: %s", incoming)
 
-        # ✅ Réponse EXACTE attendue par Meta pour passer l’état
         action = incoming.get("action")
         screen = incoming.get("screen")
         flow_token = incoming.get("flow_token")
-        
-        # 1) Status check
+
+        # ✅ 1) Status check
         if action == "ping":
-            response_payload = {"data": {"status": "active"}}
-        
-        # 2) Request data on first screen
+            response_payload = {"version": "3.0", "data": {"status": "active"}}
+
+        # ✅ 2) Request data on first screen
         elif action == "data_exchange" and screen == "QUESTION_ONE":
-            # segment: soit depuis flow_token (recommandé), soit fallback
-            # Exemple flow_token = "SEG_CASA_RABAT|random123"
+            # Exemple flow_token: "SEG_CASA_RABAT|test1"
             segment = None
             if flow_token and "|" in flow_token:
                 segment = flow_token.split("|", 1)[0].strip()
-        
+
             response_payload = {
+                "version": "3.0",
                 "screen": "QUESTION_ONE",
                 "data": {
                     "campaign_id": os.getenv("DEFAULT_CAMPAIGN_ID", "SURVEY_2026_01_22"),
                     "segment": segment or os.getenv("DEFAULT_SEGMENT", "SEG_DEFAULT"),
                 },
             }
-        
-        # 3) Default safe response
+
+        # ✅ fallback safe
         else:
-            response_payload = {"data": {"status": "active"}}
+            response_payload = {"version": "3.0", "data": {"status": "active"}}
 
-
-        # 3) Chiffrer la réponse (AES-GCM) avec IV “flippé”
+        # 3) Chiffrer la réponse (AES-GCM) avec IV flippé
         out_iv = flip_iv(iv)
         encrypted_response_bytes = aes_gcm_encrypt(
             json.dumps(response_payload, separators=(",", ":")).encode("utf-8"),
@@ -135,9 +136,12 @@ def flow_endpoint():
         return Response(encrypted_response_b64, status=200, mimetype="text/plain")
 
     except KeyError as e:
-        # Meta envoie toujours les 3 champs en POST, mais au cas où
         return jsonify({"error": "missing_field", "details": str(e)}), 400
     except Exception as e:
-        # Si Meta voit 500, regarde Render logs -> cette "details"
         app.logger.exception("Flow endpoint error")
         return jsonify({"error": "internal_error", "details": str(e)}), 500
+
+
+if __name__ == "__main__":
+    # Local only (Render uses gunicorn)
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), debug=False)
