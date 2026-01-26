@@ -92,7 +92,34 @@ def flow_endpoint():
         app.logger.info("Incoming flow payload: %s", incoming)
 
         # ✅ Réponse EXACTE attendue par Meta pour passer l’état
-        response_payload = {"data": {"status": "active"}}
+        action = incoming.get("action")
+        screen = incoming.get("screen")
+        flow_token = incoming.get("flow_token")
+        
+        # 1) Status check
+        if action == "ping":
+            response_payload = {"data": {"status": "active"}}
+        
+        # 2) Request data on first screen
+        elif action == "data_exchange" and screen == "QUESTION_ONE":
+            # segment: soit depuis flow_token (recommandé), soit fallback
+            # Exemple flow_token = "SEG_CASA_RABAT|random123"
+            segment = None
+            if flow_token and "|" in flow_token:
+                segment = flow_token.split("|", 1)[0].strip()
+        
+            response_payload = {
+                "screen": "QUESTION_ONE",
+                "data": {
+                    "campaign_id": os.getenv("DEFAULT_CAMPAIGN_ID", "SURVEY_2026_01_22"),
+                    "segment": segment or os.getenv("DEFAULT_SEGMENT", "SEG_DEFAULT"),
+                },
+            }
+        
+        # 3) Default safe response
+        else:
+            response_payload = {"data": {"status": "active"}}
+
 
         # 3) Chiffrer la réponse (AES-GCM) avec IV “flippé”
         out_iv = flip_iv(iv)
