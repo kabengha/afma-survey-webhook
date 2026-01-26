@@ -53,7 +53,8 @@ def append_response_row(row: list):
     gc = get_gsheet_client()
     sh = gc.open_by_key(sheet_id)
     ws = sh.worksheet(tab_name)
-    app.logger.info("Appending to sheet=%s tab=%s", sheet_id, tab_name)
+
+    app.logger.info("✅ Appending to sheet_id=%s tab=%s", sheet_id, tab_name)
     ws.append_row(row, value_input_option="RAW")
 
 
@@ -69,7 +70,6 @@ def b64encode_bytes(b: bytes) -> str:
 
 
 def flip_iv(iv: bytes) -> bytes:
-    # XOR 0xFF sur chaque byte
     return bytes([x ^ 0xFF for x in iv])
 
 
@@ -132,10 +132,10 @@ def flow_endpoint():
 
     try:
         encrypted_flow_data = b64decode_str(body["encrypted_flow_data"])
-        encrypted_aes_key = body["encrypted_aes_key"]
+        encrypted_aes_key_b64 = body["encrypted_aes_key"]
         iv = b64decode_str(body["initial_vector"])
 
-        aes_key = rsa_decrypt_aes_key(encrypted_aes_key)
+        aes_key = rsa_decrypt_aes_key(encrypted_aes_key_b64)
         plaintext = aes_gcm_decrypt(encrypted_flow_data, aes_key, iv)
         incoming = json.loads(plaintext.decode("utf-8"))
 
@@ -144,14 +144,11 @@ def flow_endpoint():
         action = (incoming.get("action") or "").upper()
         flow_token = incoming.get("flow_token")
 
-        # -------- PING --------
+        # PING
         if action == "PING":
-            response_payload = {
-                "version": "3.0",
-                "data": {"status": "active"},
-            }
+            response_payload = {"version": "3.0", "data": {"status": "active"}}
 
-        # -------- INIT / DATA_EXCHANGE --------
+        # INIT / DATA_EXCHANGE
         elif action in ("INIT", "DATA_EXCHANGE"):
             segment = None
             if flow_token and "|" in flow_token:
@@ -161,20 +158,14 @@ def flow_endpoint():
                 "version": "3.0",
                 "screen": "QUESTION_ONE",
                 "data": {
-                    "campaign_id": os.getenv(
-                        "DEFAULT_CAMPAIGN_ID", "SURVEY_2026_01_22"
-                    ),
-                    "segment": segment
-                    or os.getenv("DEFAULT_SEGMENT", "SEG_DEFAULT"),
+                    "campaign_id": os.getenv("DEFAULT_CAMPAIGN_ID", "SURVEY_2026_01_22"),
+                    "segment": segment or os.getenv("DEFAULT_SEGMENT", "SEG_DEFAULT"),
                 },
             }
 
-        # -------- SAFE FALLBACK --------
+        # fallback safe
         else:
-            response_payload = {
-                "version": "3.0",
-                "data": {"status": "active"},
-            }
+            response_payload = {"version": "3.0", "data": {"status": "active"}}
 
         out_iv = flip_iv(iv)
         encrypted_response = aes_gcm_encrypt(
@@ -195,7 +186,7 @@ def flow_endpoint():
 
 
 # --------------------------------------------------
-# WhatsApp webhook verification
+# WhatsApp webhook verification (Meta subscribe)
 # --------------------------------------------------
 @app.route("/webhook/whatsapp", methods=["GET"])
 def whatsapp_verify():
@@ -205,9 +196,6 @@ def whatsapp_verify():
 
     VERIFY_TOKEN = os.getenv("WH_VERIFY_TOKEN", "my_verify_token")
 
-    app.logger.info("Webhook verify: mode=%s token=%s", mode, token)
-    app.logger.info("Server WH_VERIFY_TOKEN=%s", os.getenv("WH_VERIFY_TOKEN"))
-
     if mode == "subscribe" and token == VERIFY_TOKEN:
         return Response(challenge, status=200, mimetype="text/plain")
 
@@ -215,29 +203,40 @@ def whatsapp_verify():
 
 
 # --------------------------------------------------
-# WhatsApp messages webhook (Flow responses)
+# WhatsApp messages webhook (Flow answers) -> Google Sheets
 # --------------------------------------------------
 @app.route("/webhook/whatsapp", methods=["POST"])
 def whatsapp_messages():
     payload = request.get_json(silent=True) or {}
-    app.logger.info("Incoming WhatsApp webhook")
+
+    # ✅ Debug pour confirmer que Meta push bien ici
+    app.logger.info("✅ Incoming WhatsApp webhook HIT")
+    app.logger.info("Incoming WhatsApp webhook payload: %s", payload)
 
     try:
         entries = payload.get("entry") or []
+        if not entries:
+            return jsonify({"status": "ignored_no_entry"}), 200
+
+        saved_count = 0
+
         for entry in entries:
             changes = entry.get("changes") or []
             for change in changes:
                 value = change.get("value") or {}
                 messages = value.get("messages") or []
+                if not messages:
+                    continue
 
                 for msg in messages:
+                    from_number = msg.get("from", "")
+                    ts = datetime.datetime.utcnow().isoformat()
+
                     interactive = msg.get("interactive") or {}
                     nfm_reply = interactive.get("nfm_reply")
                     if not nfm_reply:
+                        # pas une réponse Flow
                         continue
-
-                    from_number = msg.get("from", "")
-                    ts = datetime.datetime.utcnow().isoformat()
 
                     response_json_str = nfm_reply.get("response_json") or "{}"
                     try:
@@ -245,32 +244,20 @@ def whatsapp_messages():
                     except Exception:
                         response_data = {"_raw": response_json_str}
 
-                    campaign_id = (
-                        response_data.get("campaign_id")
-                        or response_data.get("data", {}).get("campaign_id", "")
-                    )
-                    segment = (
-                        response_data.get("segment")
-                        or response_data.get("data", {}).get("segment", "")
-                    )
+                    # champs
+                    campaign_id = response_data.get("campaign_id") or response_data.get("data", {}).get("campaign_id", "")
+                    segment = response_data.get("segment") or response_data.get("data", {}).get("segment", "")
 
-                    q1 = response_data.get("q1") or response_data.get("data", {}).get(
-                        "q1", ""
-                    )
-                    q2 = response_data.get("q2") or response_data.get("data", {}).get(
-                        "q2", ""
-                    )
-                    q3 = response_data.get("q3") or response_data.get("data", {}).get(
-                        "q3", ""
-                    )
+                    q1 = response_data.get("q1") or response_data.get("data", {}).get("q1", "")
+                    q2 = response_data.get("q2") or response_data.get("data", {}).get("q2", "")
+                    q3 = response_data.get("q3") or response_data.get("data", {}).get("q3", "")
 
                     raw_json = json.dumps(response_data, ensure_ascii=False)
 
-                    append_response_row(
-                        [ts, from_number, campaign_id, segment, q1, q2, q3, raw_json]
-                    )
+                    append_response_row([ts, from_number, campaign_id, segment, q1, q2, q3, raw_json])
+                    saved_count += 1
 
-        return jsonify({"status": "saved"}), 200
+        return jsonify({"status": "ok", "saved": saved_count}), 200
 
     except Exception as e:
         app.logger.exception("WhatsApp webhook error")
@@ -278,11 +265,7 @@ def whatsapp_messages():
 
 
 # --------------------------------------------------
-# Local run (Render uses gunicorn)
+# Local run
 # --------------------------------------------------
 if __name__ == "__main__":
-    app.run(
-        host="0.0.0.0",
-        port=int(os.getenv("PORT", "5000")),
-        debug=False,
-    )
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), debug=False)
