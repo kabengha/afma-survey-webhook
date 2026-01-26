@@ -103,12 +103,12 @@ def flow_endpoint():
             response_payload = {"version": "3.0", "data": {"status": "active"}}
 
         # ✅ 2) Request data on first screen
-        elif action == "data_exchange" and screen == "QUESTION_ONE":
-            # Exemple flow_token: "SEG_CASA_RABAT|test1"
+        elif action in ("INIT", "data_exchange"):
+            # INIT = première demande de données du flow
             segment = None
             if flow_token and "|" in flow_token:
                 segment = flow_token.split("|", 1)[0].strip()
-
+        
             response_payload = {
                 "version": "3.0",
                 "screen": "QUESTION_ONE",
@@ -117,6 +117,7 @@ def flow_endpoint():
                     "segment": segment or os.getenv("DEFAULT_SEGMENT", "SEG_DEFAULT"),
                 },
             }
+
 
         # ✅ fallback safe
         else:
