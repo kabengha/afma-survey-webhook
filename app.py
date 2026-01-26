@@ -109,7 +109,7 @@ def flow_endpoint():
 
         # --- TODO: here you handle the flow request normally ---
         # For now we reply minimal "ok" (works for status check)
-        response_payload = {"status": "ok"}
+        response_payload = {}
 
         # 3) encrypt response with AES-GCM using flipped IV
         out_iv = flip_iv(iv)
