@@ -7,25 +7,29 @@ from cryptography.hazmat.primitives.asymmetric import padding
 
 app = Flask(__name__)
 
-# Charge la clé privée (celle qui correspond à la public key upload sur Meta)
-PRIVATE_KEY_PATH = os.getenv("PRIVATE_KEY_PATH", "private_key.pem")
+def load_private_key():
+    pem = os.getenv("PRIVATE_KEY_PEM")
+    if not pem:
+        # fallback si tu veux garder le fichier local
+        path = os.getenv("PRIVATE_KEY_PATH", "private_key.pem")
+        with open(path, "rb") as f:
+            pem_bytes = f.read()
+    else:
+        pem_bytes = pem.encode("utf-8")
 
-with open(PRIVATE_KEY_PATH, "rb") as f:
-    private_key = serialization.load_pem_private_key(
-        f.read(),
-        password=None
-    )
+    return serialization.load_pem_private_key(pem_bytes, password=None)
+
+private_key = load_private_key()
 
 @app.route("/api/survey/webhook", methods=["GET", "POST"])
 def survey_webhook():
-    # Health check simple
+    # Health check
     if request.method == "GET":
         return jsonify({"status": "ok"}), 200
 
-    # ✅ Payload EXACT attendu par Meta pour l’étape "État"
+    # ✅ EXACT attendu par Meta
     response_payload = {"data": {"status": "active"}}
 
-    # Chiffre la réponse en RSA OAEP SHA256 puis encode en base64
     encrypted = private_key.encrypt(
         json.dumps(response_payload, separators=(",", ":")).encode("utf-8"),
         padding.OAEP(
@@ -35,9 +39,8 @@ def survey_webhook():
         )
     )
 
-    encrypted_base64 = base64.b64encode(encrypted).decode("utf-8")
-
-    return jsonify({"encrypted_response": encrypted_base64}), 200
+    encrypted_b64 = base64.b64encode(encrypted).decode("utf-8")
+    return jsonify({"encrypted_response": encrypted_b64}), 200
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
