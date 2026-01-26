@@ -205,6 +205,9 @@ def whatsapp_verify():
 
     VERIFY_TOKEN = os.getenv("WH_VERIFY_TOKEN", "my_verify_token")
 
+    app.logger.info("Webhook verify: mode=%s token=%s", mode, token)
+    app.logger.info("Server WH_VERIFY_TOKEN=%s", os.getenv("WH_VERIFY_TOKEN"))
+
     if mode == "subscribe" and token == VERIFY_TOKEN:
         return Response(challenge, status=200, mimetype="text/plain")
 
