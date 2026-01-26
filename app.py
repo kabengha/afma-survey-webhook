@@ -53,6 +53,7 @@ def append_response_row(row: list):
     gc = get_gsheet_client()
     sh = gc.open_by_key(sheet_id)
     ws = sh.worksheet(tab_name)
+    app.logger.info("Appending to sheet=%s tab=%s", sheet_id, tab_name)
     ws.append_row(row, value_input_option="RAW")
 
 
