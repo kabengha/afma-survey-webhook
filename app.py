@@ -22,11 +22,22 @@ app.logger.setLevel(logging.INFO)
 
 
 # --------------------------------------------------
-# RSA private key (Meta Flow)
+# Load RSA private key for Meta Flows
+# Prefer ENV var on Render, fallback to file path
 # --------------------------------------------------
-PRIVATE_KEY_PATH = os.getenv("PRIVATE_KEY_PATH", "private_key.pem")
-with open(PRIVATE_KEY_PATH, "rb") as f:
-    PRIVATE_KEY = load_pem_private_key(f.read(), password=None)
+def load_private_key():
+    pem_env = os.getenv("PRIVATE_KEY_PEM")
+    if pem_env:
+        app.logger.info("✅ Loading PRIVATE_KEY from env PRIVATE_KEY_PEM")
+        return load_pem_private_key(pem_env.encode("utf-8"), password=None)
+
+    path = os.getenv("PRIVATE_KEY_PATH", "private_key.pem")
+    app.logger.info("ℹ️ PRIVATE_KEY_PEM not set, loading PRIVATE_KEY from file: %s", path)
+    with open(path, "rb") as f:
+        return load_pem_private_key(f.read(), password=None)
+
+
+PRIVATE_KEY = load_private_key()
 
 
 # --------------------------------------------------
@@ -46,7 +57,6 @@ def get_gsheet_client():
 def append_response_row(row: list):
     sheet_id = os.getenv("GSHEET_ID")
     tab_name = os.getenv("GSHEET_TAB", "responses")
-
     if not sheet_id:
         raise RuntimeError("Missing env GSHEET_ID")
 
@@ -59,13 +69,20 @@ def append_response_row(row: list):
 
 
 # --------------------------------------------------
-# Crypto helpers
+# Crypto helpers (Meta Flows)
 # --------------------------------------------------
 def b64decode_str(s: str) -> bytes:
-    return base64.b64decode(s.encode("utf-8"))
+    """
+    Meta can send urlsafe base64 and sometimes without padding.
+    This decoder handles both.
+    """
+    s = (s or "").strip()
+    s += "=" * (-len(s) % 4)  # add padding if missing
+    return base64.urlsafe_b64decode(s.encode("utf-8"))
 
 
 def b64encode_bytes(b: bytes) -> str:
+    # standard base64 output is fine for Meta to parse
     return base64.b64encode(b).decode("utf-8")
 
 
@@ -87,7 +104,7 @@ def rsa_decrypt_aes_key(encrypted_aes_key_b64: str) -> bytes:
 
 def aes_gcm_decrypt(ciphertext_plus_tag: bytes, aes_key: bytes, iv: bytes) -> bytes:
     if len(ciphertext_plus_tag) < 16:
-        raise ValueError("Invalid encrypted_flow_data")
+        raise ValueError("Invalid encrypted_flow_data (too short)")
 
     ct = ciphertext_plus_tag[:-16]
     tag = ciphertext_plus_tag[-16:]
@@ -124,31 +141,45 @@ def flow_health():
 
 
 # --------------------------------------------------
-# Meta Flow endpoint (INIT / ping)
+# Meta Flow endpoint (PING / INIT / DATA_EXCHANGE)
 # --------------------------------------------------
 @app.route("/api/survey/webhook", methods=["POST"])
 def flow_endpoint():
     body = request.get_json(silent=True) or {}
 
     try:
+        # basic validation
+        for k in ("encrypted_flow_data", "encrypted_aes_key", "initial_vector"):
+            if k not in body:
+                return jsonify({"error": f"Missing field: {k}"}), 400
+
+        # log sizes to debug
+        app.logger.info(
+            "Flow verify hit: sizes data=%s aes=%s iv=%s",
+            len(body.get("encrypted_flow_data", "")),
+            len(body.get("encrypted_aes_key", "")),
+            len(body.get("initial_vector", "")),
+        )
+
         encrypted_flow_data = b64decode_str(body["encrypted_flow_data"])
-        encrypted_aes_key_b64 = body["encrypted_aes_key"]
         iv = b64decode_str(body["initial_vector"])
 
-        aes_key = rsa_decrypt_aes_key(encrypted_aes_key_b64)
+        # RSA step
+        aes_key = rsa_decrypt_aes_key(body["encrypted_aes_key"])
+        app.logger.info("✅ RSA ok, AES key length=%s", len(aes_key))
+
+        # AES-GCM step
         plaintext = aes_gcm_decrypt(encrypted_flow_data, aes_key, iv)
         incoming = json.loads(plaintext.decode("utf-8"))
-
         app.logger.info("Incoming Flow payload: %s", incoming)
 
         action = (incoming.get("action") or "").upper()
         flow_token = incoming.get("flow_token")
 
-        # PING
+        # Build response payload (plaintext)
         if action == "PING":
             response_payload = {"version": "3.0", "data": {"status": "active"}}
 
-        # INIT / DATA_EXCHANGE
         elif action in ("INIT", "DATA_EXCHANGE"):
             segment = None
             if flow_token and "|" in flow_token:
@@ -163,10 +194,11 @@ def flow_endpoint():
                 },
             }
 
-        # fallback safe
         else:
+            # safe fallback
             response_payload = {"version": "3.0", "data": {"status": "active"}}
 
+        # Encrypt response using flipped IV
         out_iv = flip_iv(iv)
         encrypted_response = aes_gcm_encrypt(
             json.dumps(response_payload, separators=(",", ":")).encode("utf-8"),
@@ -174,6 +206,7 @@ def flow_endpoint():
             out_iv,
         )
 
+        # Meta expects body = base64(ciphertext||tag)
         return Response(
             b64encode_bytes(encrypted_response),
             status=200,
@@ -181,7 +214,8 @@ def flow_endpoint():
         )
 
     except Exception as e:
-        app.logger.exception("Flow endpoint error")
+        app.logger.exception("❌ Flow endpoint error")
+        # Return 500 for debug (Meta will show it)
         return jsonify({"error": str(e)}), 500
 
 
@@ -209,7 +243,6 @@ def whatsapp_verify():
 def whatsapp_messages():
     payload = request.get_json(silent=True) or {}
 
-    # ✅ Debug pour confirmer que Meta push bien ici
     app.logger.info("✅ Incoming WhatsApp webhook HIT")
     app.logger.info("Incoming WhatsApp webhook payload: %s", payload)
 
@@ -235,8 +268,7 @@ def whatsapp_messages():
                     interactive = msg.get("interactive") or {}
                     nfm_reply = interactive.get("nfm_reply")
                     if not nfm_reply:
-                        # pas une réponse Flow
-                        continue
+                        continue  # not a Flow reply
 
                     response_json_str = nfm_reply.get("response_json") or "{}"
                     try:
@@ -244,13 +276,15 @@ def whatsapp_messages():
                     except Exception:
                         response_data = {"_raw": response_json_str}
 
-                    # champs
-                    campaign_id = response_data.get("campaign_id") or response_data.get("data", {}).get("campaign_id", "")
-                    segment = response_data.get("segment") or response_data.get("data", {}).get("segment", "")
+                    # flexible extraction
+                    data_obj = response_data.get("data", {}) if isinstance(response_data, dict) else {}
 
-                    q1 = response_data.get("q1") or response_data.get("data", {}).get("q1", "")
-                    q2 = response_data.get("q2") or response_data.get("data", {}).get("q2", "")
-                    q3 = response_data.get("q3") or response_data.get("data", {}).get("q3", "")
+                    campaign_id = response_data.get("campaign_id") or data_obj.get("campaign_id", "")
+                    segment = response_data.get("segment") or data_obj.get("segment", "")
+
+                    q1 = response_data.get("q1") or data_obj.get("q1", "")
+                    q2 = response_data.get("q2") or data_obj.get("q2", "")
+                    q3 = response_data.get("q3") or data_obj.get("q3", "")
 
                     raw_json = json.dumps(response_data, ensure_ascii=False)
 
@@ -260,7 +294,7 @@ def whatsapp_messages():
         return jsonify({"status": "ok", "saved": saved_count}), 200
 
     except Exception as e:
-        app.logger.exception("WhatsApp webhook error")
+        app.logger.exception("❌ WhatsApp webhook error")
         return jsonify({"error": str(e)}), 500
 
 
