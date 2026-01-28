@@ -3,3 +3,4 @@ gunicorn==22.0.0
 cryptography
 gspread
 google-auth
+cryptography==42.0.8
