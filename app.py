@@ -90,7 +90,7 @@ def extract_flow_token(body: dict, payload: dict) -> str:
 
 def handle_webhook():
     body = request.get_json(force=True, silent=False) or {}
-    app.logger.info("RAW_META_BODY=%s", json.dumps(body, ensure_ascii=False)[:8000])
+    print("RAW_META_BODY=", json.dumps(body, ensure_ascii=False)[:8000], flush=True)
     payload = extract_payload(body)
 
     phone = extract_from(body)
