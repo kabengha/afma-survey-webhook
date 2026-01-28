@@ -28,13 +28,24 @@ app.logger.setLevel(logging.INFO)
 def load_private_key():
     pem_env = os.getenv("PRIVATE_KEY_PEM")
     if pem_env:
-        app.logger.info("✅ Loading PRIVATE_KEY from env PRIVATE_KEY_PEM")
+        pem_env = pem_env.strip()
+
+        # IMPORTANT: si la clé est collée avec \n au lieu de retours ligne
+        if "\\n" in pem_env and "\n" not in pem_env:
+            pem_env = pem_env.replace("\\n", "\n")
+
+        # parfois ils ajoutent des guillemets
+        if pem_env.startswith('"') and pem_env.endswith('"'):
+            pem_env = pem_env[1:-1]
+
+        app.logger.info("✅ Loading PRIVATE_KEY from env PRIVATE_KEY_PEM (len=%s)", len(pem_env))
         return load_pem_private_key(pem_env.encode("utf-8"), password=None)
 
     path = os.getenv("PRIVATE_KEY_PATH", "private_key.pem")
-    app.logger.info("ℹ️ PRIVATE_KEY_PEM not set, loading PRIVATE_KEY from file: %s", path)
+    app.logger.info("ℹ️ Loading PRIVATE_KEY from file: %s", path)
     with open(path, "rb") as f:
         return load_pem_private_key(f.read(), password=None)
+
 
 
 PRIVATE_KEY = load_private_key()
