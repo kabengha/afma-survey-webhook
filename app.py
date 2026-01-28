@@ -8,9 +8,6 @@ from google.oauth2.service_account import Credentials
 
 app = Flask(__name__)
 
-# ----------------------------
-# Google Sheets client
-# ----------------------------
 def get_gspread_client():
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
@@ -30,7 +27,6 @@ def get_gspread_client():
 
     return gspread.authorize(creds)
 
-
 def append_row_to_sheet(row):
     sheet_id = os.getenv("GSHEET_ID")
     tab_name = os.getenv("GSHEET_TAB", "Sheet1")
@@ -43,16 +39,10 @@ def append_row_to_sheet(row):
     ws = sh.worksheet(tab_name)
     ws.append_row(row, value_input_option="RAW")
 
-
-# ----------------------------
-# Helpers
-# ----------------------------
 def now_iso():
     return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 
-
 def dig(d, *keys):
-    """Safely get nested dict keys in order."""
     cur = d
     for k in keys:
         if isinstance(cur, dict) and k in cur:
@@ -61,18 +51,7 @@ def dig(d, *keys):
             return None
     return cur
 
-
 def extract_payload(body: dict) -> dict:
-    """
-    Try to find where the flow answers live.
-    We'll look in common places:
-    - body itself
-    - body["payload"]
-    - body["flow"]
-    - body["data"]
-    - body["content"]["data"]
-    - body["message"]["content"]["data"]
-    """
     candidates = [
         body,
         dig(body, "payload"),
@@ -84,13 +63,10 @@ def extract_payload(body: dict) -> dict:
         dig(body, "message", "content"),
         dig(body, "message", "content", "data"),
     ]
-
     for c in candidates:
         if isinstance(c, dict) and any(k in c for k in ["q1", "q2", "q3", "campaign_id", "segment", "flow_token"]):
             return c
-
     return {}
-
 
 def extract_from(body: dict) -> str:
     return (
@@ -100,7 +76,6 @@ def extract_from(body: dict) -> str:
         or str(dig(body, "message", "from") or "")
         or ""
     )
-
 
 def extract_flow_token(body: dict, payload: dict) -> str:
     return (
@@ -113,44 +88,47 @@ def extract_flow_token(body: dict, payload: dict) -> str:
         or ""
     )
 
+def handle_webhook():
+    body = request.get_json(force=True, silent=False) or {}
+    payload = extract_payload(body)
+
+    phone = extract_from(body)
+    ts = now_iso()
+
+    campaign_id = payload.get("campaign_id") or dig(body, "campaign_id") or ""
+
+    segment = payload.get("segment") or dig(body, "segment") or ""
+    flow_token = extract_flow_token(body, payload)
+    if not segment and flow_token:
+        segment = flow_token
+
+    q1 = payload.get("q1", "") or dig(body, "q1") or ""
+    q2 = payload.get("q2", "") or dig(body, "q2") or ""
+    q3 = payload.get("q3", "") or dig(body, "q3") or ""
+
+    raw_json = json.dumps(payload if payload else body, ensure_ascii=False)
+
+    row = [ts, phone, campaign_id, segment, q1, q2, q3, raw_json]
+    append_row_to_sheet(row)
+
+    return jsonify({"ok": True, "appended": row}), 200
 
 @app.post("/webhook")
 def webhook():
     try:
-        body = request.get_json(force=True, silent=False) or {}
-        payload = extract_payload(body)
-
-        phone = extract_from(body)
-        ts = now_iso()
-
-        # campaign_id
-        campaign_id = payload.get("campaign_id") or dig(body, "campaign_id") or ""
-
-        # segment normal (si Meta/Infobip le fournit)
-        segment = payload.get("segment") or dig(body, "segment") or ""
-
-        # fallback: utiliser flow_token (Jeton de flux Infobip)
-        flow_token = extract_flow_token(body, payload)
-        if not segment and flow_token:
-            segment = flow_token
-
-        # réponses
-        q1 = payload.get("q1", "") or dig(body, "q1") or ""
-        q2 = payload.get("q2", "") or dig(body, "q2") or ""
-        q3 = payload.get("q3", "") or dig(body, "q3") or ""
-
-        # raw_json (on log surtout payload si trouvé, sinon body complet)
-        raw_json = json.dumps(payload if payload else body, ensure_ascii=False)
-
-        row = [ts, phone, campaign_id, segment, q1, q2, q3, raw_json]
-        append_row_to_sheet(row)
-
-        return jsonify({"ok": True, "appended": row}), 200
-
+        return handle_webhook()
     except Exception as e:
         app.logger.exception("Webhook error")
         return jsonify({"ok": False, "error": str(e)}), 500
 
+# ✅ Aliases (IMPORTANT)
+@app.post("/webhook/whatsapp")
+def webhook_whatsapp():
+    return webhook()
+
+@app.post("/api/survey/webhook")
+def webhook_api_survey():
+    return webhook()
 
 @app.get("/health")
 def health():
