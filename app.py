@@ -2,9 +2,7 @@ import os
 import json
 import base64
 import logging
-import threading
 from datetime import datetime, timezone
-
 from flask import Flask, request, jsonify, Response
 
 import gspread
@@ -46,13 +44,6 @@ def b64d(s: str) -> bytes:
 def b64e(b: bytes) -> str:
     return base64.b64encode(b).decode("utf-8")
 
-def extract_phone_from_whatsapp_webhook(body: dict) -> str:
-    return (
-        dig(body, "entry", 0, "changes", 0, "value", "messages", 0, "from")
-        or dig(body, "entry", 0, "changes", 0, "value", "contacts", 0, "wa_id")
-        or ""
-    )
-
 # =========================
 # Google Sheets
 # =========================
@@ -85,18 +76,20 @@ def append_row_to_sheet(row):
     ws = sh.worksheet(tab_name)
     ws.append_row(row, value_input_option="RAW")
 
-def append_row_async(row):
-    def _job():
-        try:
-            append_row_to_sheet(row)
-            app.logger.info("[SHEETS] appended OK")
-        except Exception as e:
-            app.logger.exception(f"[SHEETS] append failed: {e}")
-    threading.Thread(target=_job, daemon=True).start()
+# =========================
+# Meta Flows Crypto (garder seulement pour PING)
+# =========================
+FLOW_REQUIRED_KEYS = {"encrypted_flow_data", "encrypted_aes_key", "initial_vector"}
 
-# =========================
-# Load private keys
-# =========================
+def invert_iv(iv: bytes) -> bytes:
+    return bytes((b ^ 0xFF) for b in iv)
+
+def encrypt_flow_response(resp_obj: dict, aes_key: bytes, req_iv: bytes) -> str:
+    resp_iv = invert_iv(req_iv)
+    resp_bytes = json.dumps(resp_obj, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    ct = AESGCM(aes_key).encrypt(resp_iv, resp_bytes, None)
+    return b64e(ct)
+
 def _load_one_key_from_pem(pem_str: str):
     passphrase = os.getenv("FLOW_PRIVATE_KEY_PASSPHRASE")
     password = passphrase.encode("utf-8") if passphrase else None
@@ -118,20 +111,6 @@ def load_private_keys():
 
 PRIVATE_KEYS = load_private_keys()
 print(f"[BOOT] Loaded {len(PRIVATE_KEYS)} private key(s)", flush=True)
-
-# =========================
-# Meta Flows Crypto
-# =========================
-FLOW_REQUIRED_KEYS = {"encrypted_flow_data", "encrypted_aes_key", "initial_vector"}
-
-def invert_iv(iv: bytes) -> bytes:
-    return bytes((b ^ 0xFF) for b in iv)
-
-def encrypt_flow_response(resp_obj: dict, aes_key: bytes, req_iv: bytes) -> str:
-    resp_iv = invert_iv(req_iv)
-    resp_bytes = json.dumps(resp_obj, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-    ct = AESGCM(aes_key).encrypt(resp_iv, resp_bytes, None)
-    return b64e(ct)
 
 def decrypt_flow_payload_try_all_keys(body: dict):
     enc_aes_key = b64d(body["encrypted_aes_key"])
@@ -167,104 +146,64 @@ def root():
 def health():
     return "OK", 200
 
-# ---- FLOWS endpoint (Meta)
+# Flow endpoint (juste pour ping / status)
 @app.get("/api/survey/webhook")
 def flow_get():
     return "OK", 200
 
 @app.post("/api/survey/webhook")
-@app.post("/webhook/flow")
-def flow_endpoint():
-    app.logger.info(f"[FLOW] HIT path={request.path} ua={request.headers.get('User-Agent','')}")
+def flow_post():
     try:
         body = request.get_json(force=True, silent=False) or {}
-        app.logger.info(f"[FLOW] RAW keys={list(body.keys()) if isinstance(body, dict) else type(body)}")
-
         if not isinstance(body, dict) or not FLOW_REQUIRED_KEYS.issubset(set(body.keys())):
-            app.logger.warning("[FLOW] Not a flows encrypted payload (missing keys)")
             return Response("OK", status=200, mimetype="text/plain")
 
         req, aes_key, iv, key_idx = decrypt_flow_payload_try_all_keys(body)
         action = req.get("action")
         version = req.get("version", "3.0")
-        data = req.get("data") or {}
-        flow_token = req.get("flow_token", "") or req.get("token", "")
+        app.logger.info(f"[FLOW] action={action} using_key={key_idx}")
 
-        app.logger.info(f"[FLOW] DECRYPTED action={action} using_key={key_idx} data_keys={list(data.keys())}")
-
-        # PING
         if action == "ping":
             resp_obj = {"version": version, "data": {"status": "active"}}
-            encrypted = encrypt_flow_response(resp_obj, aes_key, iv)
-            return Response(encrypted, status=200, mimetype="text/plain")
+            return Response(encrypt_flow_response(resp_obj, aes_key, iv), status=200, mimetype="text/plain")
 
-        # DATA_EXCHANGE: log + close fast
-        q1 = data.get("q1", "") or ""
-        q2 = data.get("q2", "") or ""
-        q3 = data.get("q3", "") or ""
-        campaign_id = data.get("campaign_id", "") or ""
-        segment = data.get("segment", "") or ""
-
-        # ✅ répond tout de suite (ultra minimal)
-        resp_obj = {
-            "version": version,
-            "flow_token": flow_token,
-            "close_flow": True
-        }
-        encrypted = encrypt_flow_response(resp_obj, aes_key, iv)
-
-        # ✅ écriture Sheets en background (ne bloque pas la réponse)
-        ts = now_iso()
-        raw_json = json.dumps(req, ensure_ascii=False)
-        append_row_async([ts, "", flow_token, campaign_id, segment, q1, q2, q3, raw_json])
-
-        return Response(encrypted, status=200, mimetype="text/plain")
+        # IMPORTANT: on répond OK vite, sans rien faire
+        resp_obj = {"version": version, "data": {"ok": True}}
+        return Response(encrypt_flow_response(resp_obj, aes_key, iv), status=200, mimetype="text/plain")
 
     except Exception as e:
-        app.logger.exception(f"[FLOW] Error: {e}")
-        # même en erreur, on renvoie OK plain pour éviter blocage
+        app.logger.exception(f"[FLOW] error: {e}")
         return Response("OK", status=200, mimetype="text/plain")
 
-# ---- WhatsApp webhook (pour récupérer le phone + nfm_reply)
-@app.get("/webhook/whatsapp")
-def whatsapp_get():
-    return "OK", 200
-
+# WhatsApp webhook : ici tu récupères PHONE + réponses
 @app.post("/webhook/whatsapp")
-def whatsapp_post():
-    try:
-        body = request.get_json(force=True, silent=False) or {}
-        ts = now_iso()
-        phone = extract_phone_from_whatsapp_webhook(body)
+def webhook_whatsapp():
+    body = request.get_json(force=True, silent=False) or {}
+    ts = now_iso()
 
-        msg = dig(body, "entry", 0, "changes", 0, "value", "messages", 0) or {}
-        it = msg.get("interactive") or {}
+    msg = dig(body, "entry", 0, "changes", 0, "value", "messages", 0) or {}
+    phone = msg.get("from", "")
 
-        # Flows reply
-        if it.get("type") == "nfm_reply":
-            nfm = it.get("nfm_reply") or {}
-            resp_json_str = nfm.get("response_json", "{}")
-            try:
-                resp = json.loads(resp_json_str)
-            except Exception:
-                resp = {}
+    it = msg.get("interactive") or {}
+    if it.get("type") == "nfm_reply":
+        nfm = it.get("nfm_reply") or {}
+        resp_json_str = nfm.get("response_json", "{}")
+        try:
+            resp = json.loads(resp_json_str)
+        except Exception:
+            resp = {}
 
-            q1 = resp.get("q1", "")
-            q2 = resp.get("q2", "")
-            q3 = resp.get("q3", "")
-            campaign_id = resp.get("campaign_id", "")
-            segment = resp.get("segment", "")
+        q1 = resp.get("q1", "")
+        q2 = resp.get("q2", "")
+        q3 = resp.get("q3", "")
+        campaign_id = resp.get("campaign_id", "")
+        segment = resp.get("segment", "")
 
-            append_row_async([ts, phone, "", campaign_id, segment, q1, q2, q3, json.dumps(body, ensure_ascii=False)])
-            return jsonify({"ok": True}), 200
-
-        # sinon log brut
-        append_row_async([ts, phone, "", "", "", "", "", "", json.dumps(body, ensure_ascii=False)])
+        append_row_to_sheet([ts, phone, "", campaign_id, segment, q1, q2, q3, json.dumps(body, ensure_ascii=False)])
         return jsonify({"ok": True}), 200
 
-    except Exception as e:
-        app.logger.exception(f"[WSP] Error: {e}")
-        return jsonify({"ok": True}), 200
+    append_row_to_sheet([ts, phone, "", "", "", "", "", "", json.dumps(body, ensure_ascii=False)])
+    return jsonify({"ok": True}), 200
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
