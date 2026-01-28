@@ -35,19 +35,6 @@ def dig(d, *keys):
             return None
     return cur
 
-def extract_phone_from_anywhere(obj: dict) -> str:
-    candidates = [
-        dig(obj, "from"),
-        dig(obj, "contacts", 0, "wa_id"),
-        dig(obj, "messages", 0, "from"),
-        dig(obj, "entry", 0, "changes", 0, "value", "messages", 0, "from"),
-        dig(obj, "entry", 0, "changes", 0, "value", "contacts", 0, "wa_id"),
-    ]
-    for c in candidates:
-        if c:
-            return str(c)
-    return ""
-
 def b64d(s: str) -> bytes:
     s = (s or "").strip()
     s += "=" * (-len(s) % 4)
@@ -60,9 +47,16 @@ def b64e(b: bytes) -> str:
     return base64.b64encode(b).decode("utf-8")
 
 # =========================
-# Google Sheets
+# Google Sheets (cache pour vitesse)
 # =========================
+_GC = None
+_WS = None
+
 def get_gspread_client():
+    global _GC
+    if _GC is not None:
+        return _GC
+
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
@@ -78,9 +72,14 @@ def get_gspread_client():
     else:
         raise RuntimeError("Missing GOOGLE_SA_JSON or GOOGLE_SERVICE_ACCOUNT_FILE")
 
-    return gspread.authorize(creds)
+    _GC = gspread.authorize(creds)
+    return _GC
 
-def append_row_to_sheet(row):
+def get_worksheet():
+    global _WS
+    if _WS is not None:
+        return _WS
+
     sheet_id = os.getenv("GSHEET_ID")
     tab_name = os.getenv("GSHEET_TAB", "Sheet1")
     if not sheet_id:
@@ -88,12 +87,18 @@ def append_row_to_sheet(row):
 
     gc = get_gspread_client()
     sh = gc.open_by_key(sheet_id)
-    ws = sh.worksheet(tab_name)
+    _WS = sh.worksheet(tab_name)
+    return _WS
+
+def append_row_to_sheet(row):
+    ws = get_worksheet()
     ws.append_row(row, value_input_option="RAW")
 
 # =========================
-# Load private keys (Flows)
+# Meta Flows - Keys
 # =========================
+FLOW_REQUIRED_KEYS = {"encrypted_flow_data", "encrypted_aes_key", "initial_vector"}
+
 def _load_one_key_from_pem(pem_str: str):
     passphrase = os.getenv("FLOW_PRIVATE_KEY_PASSPHRASE")
     password = passphrase.encode("utf-8") if passphrase else None
@@ -102,35 +107,27 @@ def _load_one_key_from_pem(pem_str: str):
 
 def load_private_keys():
     keys = []
-
-    # numbered keys
     for i in range(1, 6):
         pem = os.getenv(f"FLOW_PRIVATE_KEY_PEM_{i}")
         if pem:
             keys.append(_load_one_key_from_pem(pem))
 
-    # fallback single
     pem_single = os.getenv("FLOW_PRIVATE_KEY_PEM")
     if pem_single:
         keys.append(_load_one_key_from_pem(pem_single))
 
     if not keys:
         raise RuntimeError("No private keys found. Set FLOW_PRIVATE_KEY_PEM or FLOW_PRIVATE_KEY_PEM_1")
-
     return keys
 
 PRIVATE_KEYS = load_private_keys()
 print(f"[BOOT] Loaded {len(PRIVATE_KEYS)} private key(s)", flush=True)
 
-# =========================
-# Meta Flows Crypto
-# =========================
-FLOW_REQUIRED_KEYS = {"encrypted_flow_data", "encrypted_aes_key", "initial_vector"}
-
 def invert_iv(iv: bytes) -> bytes:
     return bytes((b ^ 0xFF) for b in iv)
 
 def encrypt_flow_response(resp_obj: dict, aes_key: bytes, req_iv: bytes) -> str:
+    # Meta flows: IV réponse = inversion de l'IV request
     resp_iv = invert_iv(req_iv)
     resp_bytes = json.dumps(resp_obj, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     ct = AESGCM(aes_key).encrypt(resp_iv, resp_bytes, None)
@@ -142,7 +139,6 @@ def decrypt_flow_payload_try_all_keys(body: dict):
     ciphertext_and_tag = b64d(body["encrypted_flow_data"])
 
     last_err = None
-
     for idx, key in enumerate(PRIVATE_KEYS, start=1):
         try:
             aes_key = key.decrypt(
@@ -162,7 +158,7 @@ def decrypt_flow_payload_try_all_keys(body: dict):
     raise ValueError(f"Decryption failed for all keys: {last_err}")
 
 # =========================
-# Basic routes
+# Routes basics
 # =========================
 @app.get("/")
 def root():
@@ -172,13 +168,13 @@ def root():
 def health():
     return "OK", 200
 
-# (Optional) to quickly test endpoint alive
+# Alias GET (si Meta fait un GET)
 @app.get("/api/survey/webhook")
 def flow_alias_get():
     return "OK", 200
 
 # =========================
-# Flow Endpoint (Meta Flows)
+# FLOW endpoint (rapide, sans Google Sheets)
 # =========================
 @app.post("/flow")
 def flow_endpoint():
@@ -189,13 +185,8 @@ def flow_endpoint():
         body = request.get_json(force=True, silent=False) or {}
         print("[FLOW] RAW keys=", list(body.keys()) if isinstance(body, dict) else str(type(body)), flush=True)
 
-        ua = request.headers.get("User-Agent", "")
-        app.logger.info(f"[FLOW] UA={ua}")
-        app.logger.info(f"[FLOW] RAW keys={list(body.keys()) if isinstance(body, dict) else type(body)}")
-
-        # If not encrypted payload => return OK (Meta sometimes pings differently)
         if not isinstance(body, dict) or not FLOW_REQUIRED_KEYS.issubset(set(body.keys())):
-            app.logger.warning("[FLOW] Missing encrypted fields -> not a valid Meta Flows request")
+            # IMPORTANT: répondre 200 OK pour éviter des retries bizarres
             return Response("OK", status=200, mimetype="text/plain")
 
         req, aes_key, iv, key_idx = decrypt_flow_payload_try_all_keys(body)
@@ -203,9 +194,7 @@ def flow_endpoint():
         action = req.get("action")
         version = req.get("version", "3.0")
 
-        data = req.get("data") or {}
-        print(f"[FLOW] DECRYPTED action={action} using_key={key_idx} data_keys={list(data.keys())}", flush=True)
-        app.logger.info(f"[FLOW] DECRYPTED action={action} using_key={key_idx} keys={list(req.keys())}")
+        print(f"[FLOW] DECRYPTED action={action} using_key={key_idx} keys={list(req.keys())}", flush=True)
 
         # PING
         if action == "ping":
@@ -213,106 +202,89 @@ def flow_endpoint():
             encrypted = encrypt_flow_response(resp_obj, aes_key, iv)
             return Response(encrypted, status=200, mimetype="text/plain")
 
-        # DATA_EXCHANGE / SUBMIT
-        flow_token = req.get("flow_token", "") or req.get("token", "")
-
-        q1 = data.get("q1", "") or data.get("Q1", "") or ""
-        q2 = data.get("q2", "") or data.get("Q2", "") or ""
-        q3 = data.get("q3", "") or data.get("Q3", "") or ""
-
-        campaign_id = data.get("campaign_id", "") or ""
-        segment = data.get("segment", "") or ""
-
-        # (optional) may be empty for flows
-        phone = extract_phone_from_anywhere(req)
-
-        ts = now_iso()
-        raw_json = json.dumps(req, ensure_ascii=False)
-
-        # We can log it, but do NOT block the user if Sheets fails
-        try:
-            append_row_to_sheet([ts, phone, flow_token, campaign_id, segment, q1, q2, q3, raw_json])
-        except Exception as e:
-            print("[SHEETS] ERROR:", str(e), flush=True)
-
-        # close flow nicely
-        resp_obj = {
-            "version": version,
-            "flow_token": flow_token,
-            "close_flow": True,
-            "data": {"ok": True}
-        }
+        # DATA_EXCHANGE (final)
+        # => on répond vite, et on laisse /webhook/whatsapp enregistrer avec le phone
+        resp_obj = {"version": version, "data": {"ok": True}}
         encrypted = encrypt_flow_response(resp_obj, aes_key, iv)
         return Response(encrypted, status=200, mimetype="text/plain")
 
     except Exception:
         app.logger.exception("[FLOW] Error")
+        # même ici: 200 OK peut éviter l’erreur côté WhatsApp, mais gardons 400 pour debug.
         return Response("ERROR", status=400, mimetype="text/plain")
 
-# Aliases that Meta uses (your endpoint URL in dashboard)
+# Aliases pour Meta URL
 @app.post("/api/survey/webhook")
 @app.post("/webhook/flow")
 def flow_alias():
     return flow_endpoint()
 
 # =========================
-# WhatsApp Cloud API Webhook
-# This is where we get: phone + interactive.nfm_reply.response_json
+# WhatsApp webhook (c’est LÀ que tu récupères phone + réponses)
 # =========================
-@app.post("/webhook/whatsapp")
-def webhook_whatsapp():
-    body = request.get_json(force=True, silent=False) or {}
-    ts = now_iso()
-
-    msg = dig(body, "entry", 0, "changes", 0, "value", "messages", 0) or {}
-    phone = msg.get("from", "")
-
-    it = msg.get("interactive") or {}
-    if it.get("type") == "nfm_reply":
-        nfm = it.get("nfm_reply") or {}
-        resp_json_str = nfm.get("response_json", "{}")
-
-        try:
-            resp = json.loads(resp_json_str)
-        except Exception:
-            resp = {}
-
-        q1 = resp.get("q1", "")
-        q2 = resp.get("q2", "")
-        q3 = resp.get("q3", "")
-        campaign_id = resp.get("campaign_id", "")
-        segment = resp.get("segment", "")
-
-        append_row_to_sheet([ts, phone, "", campaign_id, segment, q1, q2, q3, json.dumps(body, ensure_ascii=False)])
-        return jsonify({"ok": True}), 200
-
-    # if not nfm_reply, log raw
-    append_row_to_sheet([ts, phone, "", "", "", "", "", "", json.dumps(body, ensure_ascii=False)])
-    return jsonify({"ok": True}), 200
-
 @app.get("/webhook/whatsapp")
 def webhook_whatsapp_get():
+    # Si tu fais la vérification Meta (hub.challenge), tu peux l’ajouter ici.
     return "OK", 200
 
-# =========================
-# Optional classic webhook (keep if you want)
-# =========================
-@app.post("/webhook")
-def webhook():
+@app.post("/webhook/whatsapp")
+def webhook_whatsapp_post():
     try:
         body = request.get_json(force=True, silent=False) or {}
         ts = now_iso()
-        phone = extract_phone_from_anywhere(body)
-        raw_json = json.dumps(body, ensure_ascii=False)
-        append_row_to_sheet([ts, phone, "", "", "", "", "", "", raw_json])
-        return jsonify({"ok": True}), 200
-    except Exception as e:
-        app.logger.exception("[WEBHOOK] Error")
-        return jsonify({"ok": False, "error": str(e)}), 200
 
+        msg = dig(body, "entry", 0, "changes", 0, "value", "messages", 0) or {}
+        phone = str(msg.get("from", ""))
+
+        it = msg.get("interactive") or {}
+        if it.get("type") == "nfm_reply":
+            nfm = it.get("nfm_reply") or {}
+            resp_json_str = nfm.get("response_json", "{}")
+
+            try:
+                resp = json.loads(resp_json_str)
+            except Exception:
+                resp = {}
+
+            q1 = resp.get("q1", "")
+            q2 = resp.get("q2", "")
+            q3 = resp.get("q3", "")
+            campaign_id = resp.get("campaign_id", "")
+            segment = resp.get("segment", "")
+
+            # ✅ Ici tu as le phone + réponses
+            append_row_to_sheet([
+                ts, phone, "", campaign_id, segment, q1, q2, q3, json.dumps(body, ensure_ascii=False)
+            ])
+            return jsonify({"ok": True}), 200
+
+        # Sinon: log brut
+        append_row_to_sheet([ts, phone, "", "", "", "", "", "", json.dumps(body, ensure_ascii=False)])
+        return jsonify({"ok": True}), 200
+
+    except Exception:
+        app.logger.exception("[WABA] Error")
+        # On renvoie 200 pour éviter des retries Meta
+        return jsonify({"ok": False}), 200
+
+# =========================
+# Optional classic webhook
+# =========================
 @app.get("/webhook")
 def webhook_get():
     return "OK", 200
+
+@app.post("/webhook")
+def webhook_post():
+    try:
+        body = request.get_json(force=True, silent=False) or {}
+        ts = now_iso()
+        phone = str(dig(body, "from") or "")
+        append_row_to_sheet([ts, phone, "", "", "", "", "", "", json.dumps(body, ensure_ascii=False)])
+        return jsonify({"ok": True}), 200
+    except Exception:
+        app.logger.exception("[WEBHOOK] Error")
+        return jsonify({"ok": False}), 200
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
