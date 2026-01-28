@@ -252,9 +252,10 @@ def flow_endpoint():
 
         resp_obj = {
             "version": version,
+            "flow_token": flow_token,   # IMPORTANT
+            "close_flow": True,         # IMPORTANT
             "data": {
-                "status": "success",
-                "result": "ok"
+                "ok": True              # optionnel
             }
         }
 
