@@ -103,56 +103,24 @@ def b64d(s: str) -> bytes:
     except Exception:
         return base64.urlsafe_b64decode(s)
 
-def decrypt_encrypted_flow_data(enc_b64: str) -> dict:
+def decrypt_encrypted_flow_data(body: dict) -> dict:
     """
-    Meta Flows: often hybrid encryption.
-    encrypted_flow_data is frequently base64(JSON) where JSON contains:
-      - encrypted_aes_key (RSA-OAEP)
-      - iv (nonce)
-      - data/ciphertext (AES-GCM ciphertext)
-      - tag (sometimes separate, sometimes appended)
-      - aad (optional)
-    This function tries to handle common variants.
+    Decrypt Meta/Infobip flow payload when fields are:
+      - encrypted_aes_key (base64 RSA-OAEP encrypted AES key)
+      - initial_vector (base64 IV/nonce)
+      - encrypted_flow_data (base64 AES-GCM ciphertext (often includes tag at end))
     """
     private_key = load_private_key()
 
-    raw = b64d(enc_b64)
+    enc_key_b64 = body.get("encrypted_aes_key")
+    iv_b64 = body.get("initial_vector")
+    data_b64 = body.get("encrypted_flow_data")
 
-    # Try: raw itself is JSON
-    try:
-        txt = raw.decode("utf-8")
-        obj = json.loads(txt)
-    except Exception:
-        # If not JSON, it's not the expected hybrid container
-        raise RuntimeError("encrypted_flow_data is not base64(JSON). Need the full payload structure from Meta/Infobip to decrypt.")
-
-    # Debug: print only keys (safe)
-    print("FLOW_ENC_KEYS=", list(obj.keys()), flush=True)
-
-    # Detect common field names
-    aes_key_field_candidates = ["encrypted_aes_key", "encrypted_key", "enc_key", "aes_key_encrypted", "encryptedKey"]
-    iv_field_candidates = ["iv", "nonce", "initial_vector", "initialVector"]
-    data_field_candidates = ["data", "ciphertext", "encrypted_data", "payload", "cipherText"]
-    tag_field_candidates = ["tag", "auth_tag", "authentication_tag", "authTag", "gcm_tag"]
-    aad_field_candidates = ["aad", "associated_data", "associatedData"]
-
-    def pick(d, names):
-        for n in names:
-            if n in d and d[n]:
-                return n, d[n]
-        return None, None
-
-    aes_key_field, aes_key_b64 = pick(obj, aes_key_field_candidates)
-    iv_field, iv_b64 = pick(obj, iv_field_candidates)
-    data_field, data_b64 = pick(obj, data_field_candidates)
-    tag_field, tag_b64 = pick(obj, tag_field_candidates)
-    aad_field, aad_b64 = pick(obj, aad_field_candidates)
-
-    if not (aes_key_b64 and iv_b64 and data_b64):
-        raise RuntimeError(f"Missing required fields in encrypted container. Found keys={list(obj.keys())}")
+    if not (enc_key_b64 and iv_b64 and data_b64):
+        raise RuntimeError("Missing encrypted_aes_key / initial_vector / encrypted_flow_data")
 
     # 1) RSA decrypt AES key
-    enc_aes_key = b64d(aes_key_b64)
+    enc_aes_key = b64d(enc_key_b64)
     aes_key = private_key.decrypt(
         enc_aes_key,
         padding.OAEP(
@@ -162,24 +130,20 @@ def decrypt_encrypted_flow_data(enc_b64: str) -> dict:
         ),
     )
 
-    # 2) AES-GCM decrypt data
+    # 2) AES-GCM decrypt
     iv = b64d(iv_b64)
-    ciphertext = b64d(data_b64)
+    ciphertext_and_tag = b64d(data_b64)
 
-    # Some formats send tag separately
-    if tag_b64:
-        tag = b64d(tag_b64)
-        ciphertext = ciphertext + tag  # AESGCM expects ciphertext||tag
-
-    aad = b64d(aad_b64) if aad_b64 else None
-
-    plaintext = AESGCM(aes_key).decrypt(iv, ciphertext, aad)
+    # IMPORTANT:
+    # AESGCM.decrypt expects ciphertext||tag (tag is last 16 bytes) — Meta usually sends that combined.
+    plaintext = AESGCM(aes_key).decrypt(iv, ciphertext_and_tag, None)
 
     # 3) JSON output
     try:
         return json.loads(plaintext.decode("utf-8"))
     except Exception:
         return {"_decrypted_text": plaintext.decode("utf-8", errors="replace")}
+
 
 
 def extract_payload(body: dict) -> dict:
@@ -192,14 +156,14 @@ def extract_payload(body: dict) -> dict:
 
     if enc:
         try:
-            clear = decrypt_encrypted_flow_data(enc)
+            clear = decrypt_encrypted_flow_data(body)  # <-- pass body, not enc
             return clear if isinstance(clear, dict) else {"_decrypted": clear}
         except Exception as e:
-            # IMPORTANT: do not raise, keep service "available"
             return {
                 "_decrypt_error": str(e),
                 "encrypted_flow_data": enc
             }
+
 
     # 2) Fallback: non-encrypted formats
     candidates = [
@@ -233,12 +197,14 @@ def webhook():
             print("INCOMING encrypted_flow_data detected", flush=True)
 
         payload = extract_payload(body)
+        print("DECRYPTED_PAYLOAD_KEYS=", list(payload.keys()) if isinstance(payload, dict) else type(payload), flush=True)
+
 
         phone = extract_from(body)
         ts = now_iso()
 
-        campaign_id = payload.get("campaign_id", "")
-        segment = payload.get("segment", "") or payload.get("flow_token", "")
+        campaign_id = payload.get("campaign_id") or dig(payload, "data", "campaign_id") or ""
+        segment = payload.get("segment") or dig(payload, "data", "segment") or payload.get("flow_token", "") or ""
 
         q1 = payload.get("q1", "")
         q2 = payload.get("q2", "")
