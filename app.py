@@ -3,6 +3,7 @@ import json
 import base64
 from datetime import datetime, timezone
 
+
 from flask import Flask, request, jsonify, Response
 
 import gspread
@@ -12,6 +13,10 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.serialization import load_pem_private_key
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+import logging
+app.logger.setLevel(logging.INFO)
+
 
 
 app = Flask(__name__)
@@ -195,8 +200,13 @@ def health():
 
 @app.post("/flow")
 def flow_endpoint():
+    print("[FLOW] HIT", flush=True)
+    print("[FLOW] UA=", request.headers.get("User-Agent", ""), flush=True)
+
     try:
         body = request.get_json(force=True, silent=False) or {}
+        print("[FLOW] RAW keys=", list(body.keys()) if isinstance(body, dict) else str(type(body)), flush=True)
+
         ua = request.headers.get("User-Agent", "")
         app.logger.info(f"[FLOW] UA={ua}")
         app.logger.info(f"[FLOW] RAW keys={list(body.keys()) if isinstance(body, dict) else type(body)}")
@@ -209,6 +219,7 @@ def flow_endpoint():
 
         action = req.get("action")
         version = req.get("version", "3.0")
+        print(f"[FLOW] DECRYPTED action={action} using_key={key_idx} data_keys={list((req.get('data') or {}).keys())}", flush=True)
         app.logger.info(f"[FLOW] DECRYPTED action={action} using_key={key_idx} keys={list(req.keys())}")
 
         # PING
