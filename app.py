@@ -197,6 +197,7 @@ def health():
 
 @app.post("/flow")
 def flow_endpoint():
+    print("[FLOW] PATH=", request.path, flush=True)
     print("[FLOW] HIT", flush=True)
     print("[FLOW] UA=", request.headers.get("User-Agent", ""), flush=True)
 
@@ -210,7 +211,8 @@ def flow_endpoint():
 
         if not isinstance(body, dict) or not FLOW_REQUIRED_KEYS.issubset(set(body.keys())):
             app.logger.warning("[FLOW] Missing encrypted fields -> not a valid Meta Flows request")
-            return Response("BAD REQUEST", status=400, mimetype="text/plain")
+            return Response("OK", status=200, mimetype="text/plain")
+
 
         req, aes_key, iv, key_idx = decrypt_flow_payload_try_all_keys(body)
 
@@ -259,10 +261,18 @@ def flow_endpoint():
 
 # Aliases for your Meta URL
 @app.post("/api/survey/webhook")
-@app.post("/webhook/whatsapp")
 @app.post("/webhook/flow")
 def flow_alias():
     return flow_endpoint()
+
+@app.post("/webhook/whatsapp")
+def whatsapp_webhook_alias():
+    return webhook()
+
+@app.get("/webhook/whatsapp")
+def whatsapp_webhook_alias_get():
+    return "OK", 200
+
 
 
 # Optional classic webhook
