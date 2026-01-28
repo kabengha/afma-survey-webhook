@@ -25,8 +25,8 @@ def get_gspread_client():
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
     ]
-    sa_json = os.getenv("GOOGLE_SA_JSON")  # JSON string
-    sa_file = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE")  # file path
+    sa_json = os.getenv("GOOGLE_SA_JSON")
+    sa_file = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE")
 
     if sa_json:
         info = json.loads(sa_json)
@@ -74,8 +74,8 @@ def dig(d, *keys):
 
 def extract_phone_from_anywhere(obj: dict) -> str:
     """
-    Essaie d’extraire un numéro depuis différents formats possibles.
-    NB: Dans Flow encrypted payload, ce champ peut ne pas exister.
+    NB: Dans le payload Flow chiffré, le phone n’est pas toujours présent.
+    Donc on essaie, sinon vide => tu relies via flow_token.
     """
     candidates = [
         dig(obj, "from"),
@@ -112,11 +112,10 @@ def b64e(b: bytes) -> str:
 
 def load_private_key():
     """
-    Loads private key either from:
-      - FLOW_PRIVATE_KEY_PEM (env var)
-      - FLOW_PRIVATE_KEY_FILE (env var path) or default 'private_key.pem'
-    Render tip:
-      If env var contains literal "\\n", convert to "\n".
+    Charge la clé privée depuis:
+      - FLOW_PRIVATE_KEY_PEM (env var)   [recommandé Render]
+      - ou FLOW_PRIVATE_KEY_FILE (path)
+    Si Render stocke la PEM en une ligne avec "\\n", on convertit.
     """
     passphrase = os.getenv("FLOW_PRIVATE_KEY_PASSPHRASE")
     password = passphrase.encode("utf-8") if passphrase else None
@@ -141,27 +140,23 @@ PRIVATE_KEY = None
 
 @app.before_request
 def _init_key_once():
-    """
-    Charge la clé une fois au démarrage (lazy).
-    """
     global PRIVATE_KEY
     if PRIVATE_KEY is None:
         PRIVATE_KEY = load_private_key()
 
 
 # ============================================================
-# Meta Flows Crypto (decrypt + encrypt response)
+# Meta Flows Crypto
 # ============================================================
 
 def decrypt_flow_payload(body: dict):
     """
-    Input fields (top-level):
+    Attend les champs top-level:
       - encrypted_flow_data (base64)
       - encrypted_aes_key (base64)
       - initial_vector (base64)
 
-    Returns:
-      (req_dict, aes_key_bytes, iv_bytes)
+    Retourne: (req_dict, aes_key_bytes, iv_bytes)
     """
     enc_key_b64 = body.get("encrypted_aes_key")
     iv_b64 = body.get("initial_vector")
@@ -170,6 +165,7 @@ def decrypt_flow_payload(body: dict):
     if not (enc_key_b64 and iv_b64 and data_b64):
         raise RuntimeError("Missing encrypted_aes_key / initial_vector / encrypted_flow_data")
 
+    # RSA-OAEP decrypt AES key
     enc_aes_key = b64d(enc_key_b64)
     aes_key = PRIVATE_KEY.decrypt(
         enc_aes_key,
@@ -180,6 +176,7 @@ def decrypt_flow_payload(body: dict):
         ),
     )
 
+    # AES-GCM decrypt payload (ciphertext||tag)
     iv = b64d(iv_b64)
     ciphertext_and_tag = b64d(data_b64)
 
@@ -189,7 +186,7 @@ def decrypt_flow_payload(body: dict):
 
 
 def invert_iv(iv: bytes) -> bytes:
-    # IV response = bitwise NOT of request IV
+    # IV réponse = bitwise NOT de l’IV reçu
     return bytes((b ^ 0xFF) for b in iv)
 
 
@@ -215,42 +212,37 @@ def health():
 
 
 # ------------------------------------------------------------
-# 1) Encrypted WhatsApp Flows endpoint (Meta endpoint availability)
+# Encrypted WhatsApp Flows endpoint
 # ------------------------------------------------------------
 @app.post("/flow")
 def flow_endpoint():
     """
-    This endpoint MUST return encrypted base64 string (text/plain),
-    otherwise Meta endpoint status will show "Unable to decrypt response".
+    IMPORTANT:
+    - La réponse DOIT être une STRING base64 chiffrée (pas JSON)
+    - Content-Type text/plain
+    - IV réponse = inverted IV reçu
     """
     try:
         body = request.get_json(force=True, silent=False) or {}
+        app.logger.info(f"[FLOW] RAW keys={list(body.keys()) if isinstance(body, dict) else type(body)}")
 
-        # Debug minimal
-        app.logger.info(f"/flow RAW keys: {list(body.keys()) if isinstance(body, dict) else type(body)}")
-
-        # Decrypt
         req, aes_key, iv = decrypt_flow_payload(body)
 
         action = req.get("action")
         version = req.get("version", "3.0")
+        app.logger.info(f"[FLOW] DECRYPTED action={action} keys={list(req.keys())}")
 
-        # -------------------------
-        # A) PING (availability check)
-        # -------------------------
+        # A) PING
         if action == "ping":
             resp_obj = {"version": version, "data": {"status": "active"}}
             encrypted = encrypt_flow_response(resp_obj, aes_key, iv)
             return Response(encrypted, status=200, mimetype="text/plain")
 
-        # -------------------------
-        # B) DATA / SUBMIT
-        # -------------------------
-        # Typical structure: { action, version, screen, data, flow_token, ... }
+        # B) SUBMIT / DATA EXCHANGE
         data = req.get("data") or {}
         flow_token = req.get("flow_token", "") or req.get("token", "")
 
-        # Answers (adapt to your real field names)
+        # Champs réponses (adapte si tes keys sont différentes)
         q1 = data.get("q1", "") or data.get("Q1", "") or ""
         q2 = data.get("q2", "") or data.get("Q2", "") or ""
         q3 = data.get("q3", "") or data.get("Q3", "") or ""
@@ -258,58 +250,60 @@ def flow_endpoint():
         campaign_id = data.get("campaign_id", "") or ""
         segment = data.get("segment", "") or ""
 
-        # Phone may not exist in decrypted req => keep empty, rely on mapping by flow_token
         phone = extract_phone_from_anywhere(req)
 
         ts = now_iso()
         raw_json = json.dumps(req, ensure_ascii=False)
 
-        # Store to Sheets
+        # IMPORTANT: on ne sauvegarde pas les pings, seulement les réponses user
         row = [ts, phone, flow_token, campaign_id, segment, q1, q2, q3, raw_json]
         append_row_to_sheet(row)
 
-        # ACK response (encrypted)
+        # ACK chiffré
         resp_obj = {"version": version, "data": {"ok": True}}
         encrypted = encrypt_flow_response(resp_obj, aes_key, iv)
         return Response(encrypted, status=200, mimetype="text/plain")
 
-    except Exception as e:
-        app.logger.exception("Flow endpoint error")
-        # If decrypt fails we can't encrypt a proper response; still return 200 to avoid retries storm
-        return Response("OK", status=200, mimetype="text/plain")
+    except Exception:
+        app.logger.exception("[FLOW] Error")
+        # Si decrypt fail, ne surtout pas renvoyer une réponse en clair 200,
+        # sinon Meta dit "Impossible de décrypter la réponse"
+        return Response("ERROR", status=400, mimetype="text/plain")
 
 
 # ------------------------------------------------------------
-# 2) Classic WhatsApp webhook endpoint (optional)
-#    (This is NOT the encrypted flow endpoint)
+# ALIASES pour ton URL Meta actuelle
+# Meta = https://afma-survey-webhook.onrender.com/api/survey/webhook
+# ------------------------------------------------------------
+@app.post("/api/survey/webhook")
+@app.post("/webhook/whatsapp")
+@app.post("/webhook/flow")
+def flow_alias():
+    return flow_endpoint()
+
+
+# ------------------------------------------------------------
+# Classic WhatsApp webhook (optionnel)
 # ------------------------------------------------------------
 @app.post("/webhook")
 def webhook():
-    """
-    Use this for normal WhatsApp Cloud API webhooks.
-    Do NOT use this as your Flows encrypted endpoint.
-    """
     try:
         body = request.get_json(force=True, silent=False) or {}
         phone = extract_phone_from_anywhere(body)
         ts = now_iso()
-
-        # Example: log everything (optional)
         raw_json = json.dumps(body, ensure_ascii=False)
 
+        # Log minimal
         row = [ts, phone, "", "", "", "", "", "", raw_json]
         append_row_to_sheet(row)
 
         return jsonify({"ok": True}), 200
 
     except Exception as e:
-        app.logger.exception("Webhook error")
+        app.logger.exception("[WEBHOOK] Error")
         return jsonify({"ok": False, "error": str(e)}), 200
 
 
-# ------------------------------------------------------------
-# GET endpoints for verification (if you need them)
-# ------------------------------------------------------------
 @app.get("/webhook")
 def webhook_get():
     return "OK", 200
