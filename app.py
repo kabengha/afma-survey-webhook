@@ -241,7 +241,12 @@ def flow_endpoint():
         ts = now_iso()
         raw_json = json.dumps(req, ensure_ascii=False)
 
-        append_row_to_sheet([ts, phone, flow_token, campaign_id, segment, q1, q2, q3, raw_json])
+        try:
+            append_row_to_sheet([ts, phone, flow_token, campaign_id, segment, q1, q2, q3, raw_json])
+        except Exception as e:
+            print("[SHEETS] ERROR:", str(e), flush=True)
+            # on continue quand même à répondre OK à Meta pour ne pas bloquer l'utilisateur
+
 
         resp_obj = {"version": version, "data": {"ok": True}}
         encrypted = encrypt_flow_response(resp_obj, aes_key, iv)
