@@ -10,6 +10,8 @@ from google.oauth2.service_account import Credentials
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.serialization import load_pem_private_key
 from cryptography.hazmat.primitives.asymmetric import padding
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
 
 app = Flask(__name__)
 
@@ -92,16 +94,67 @@ def load_private_key():
 
     return load_pem_private_key(pem_bytes, password=password)
 
+def b64d(s: str) -> bytes:
+    # base64 standard / urlsafe + padding auto
+    s = s.strip()
+    s += "=" * (-len(s) % 4)
+    try:
+        return base64.b64decode(s)
+    except Exception:
+        return base64.urlsafe_b64decode(s)
+
 def decrypt_encrypted_flow_data(enc_b64: str) -> dict:
     """
-    Tries RSA OAEP decrypt of encrypted_flow_data (base64).
-    If your encrypted_flow_data format differs, we will adjust after seeing the error.
+    Meta Flows: often hybrid encryption.
+    encrypted_flow_data is frequently base64(JSON) where JSON contains:
+      - encrypted_aes_key (RSA-OAEP)
+      - iv (nonce)
+      - data/ciphertext (AES-GCM ciphertext)
+      - tag (sometimes separate, sometimes appended)
+      - aad (optional)
+    This function tries to handle common variants.
     """
     private_key = load_private_key()
-    ciphertext = base64.b64decode(enc_b64)
 
-    plaintext = private_key.decrypt(
-        ciphertext,
+    raw = b64d(enc_b64)
+
+    # Try: raw itself is JSON
+    try:
+        txt = raw.decode("utf-8")
+        obj = json.loads(txt)
+    except Exception:
+        # If not JSON, it's not the expected hybrid container
+        raise RuntimeError("encrypted_flow_data is not base64(JSON). Need the full payload structure from Meta/Infobip to decrypt.")
+
+    # Debug: print only keys (safe)
+    print("FLOW_ENC_KEYS=", list(obj.keys()), flush=True)
+
+    # Detect common field names
+    aes_key_field_candidates = ["encrypted_aes_key", "encrypted_key", "enc_key", "aes_key_encrypted", "encryptedKey"]
+    iv_field_candidates = ["iv", "nonce", "initial_vector", "initialVector"]
+    data_field_candidates = ["data", "ciphertext", "encrypted_data", "payload", "cipherText"]
+    tag_field_candidates = ["tag", "auth_tag", "authentication_tag", "authTag", "gcm_tag"]
+    aad_field_candidates = ["aad", "associated_data", "associatedData"]
+
+    def pick(d, names):
+        for n in names:
+            if n in d and d[n]:
+                return n, d[n]
+        return None, None
+
+    aes_key_field, aes_key_b64 = pick(obj, aes_key_field_candidates)
+    iv_field, iv_b64 = pick(obj, iv_field_candidates)
+    data_field, data_b64 = pick(obj, data_field_candidates)
+    tag_field, tag_b64 = pick(obj, tag_field_candidates)
+    aad_field, aad_b64 = pick(obj, aad_field_candidates)
+
+    if not (aes_key_b64 and iv_b64 and data_b64):
+        raise RuntimeError(f"Missing required fields in encrypted container. Found keys={list(obj.keys())}")
+
+    # 1) RSA decrypt AES key
+    enc_aes_key = b64d(aes_key_b64)
+    aes_key = private_key.decrypt(
+        enc_aes_key,
         padding.OAEP(
             mgf=padding.MGF1(algorithm=hashes.SHA256()),
             algorithm=hashes.SHA256(),
@@ -109,7 +162,25 @@ def decrypt_encrypted_flow_data(enc_b64: str) -> dict:
         ),
     )
 
-    return json.loads(plaintext.decode("utf-8"))
+    # 2) AES-GCM decrypt data
+    iv = b64d(iv_b64)
+    ciphertext = b64d(data_b64)
+
+    # Some formats send tag separately
+    if tag_b64:
+        tag = b64d(tag_b64)
+        ciphertext = ciphertext + tag  # AESGCM expects ciphertext||tag
+
+    aad = b64d(aad_b64) if aad_b64 else None
+
+    plaintext = AESGCM(aes_key).decrypt(iv, ciphertext, aad)
+
+    # 3) JSON output
+    try:
+        return json.loads(plaintext.decode("utf-8"))
+    except Exception:
+        return {"_decrypted_text": plaintext.decode("utf-8", errors="replace")}
+
 
 def extract_payload(body: dict) -> dict:
     # 1) If encrypted_flow_data exists, try decrypt it (but NEVER crash)
@@ -154,6 +225,8 @@ def extract_payload(body: dict) -> dict:
 def webhook():
     try:
         body = request.get_json(force=True, silent=False) or {}
+        print("RAW_BODY_KEYS=", list(body.keys()) if isinstance(body, dict) else type(body), flush=True)
+
 
         # Debug: show if encrypted payload
         if isinstance(body, dict) and "encrypted_flow_data" in body:
