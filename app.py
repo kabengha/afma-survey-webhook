@@ -114,7 +114,6 @@ def load_private_keys():
 PRIVATE_KEYS = load_private_keys()
 print(f"[BOOT] Loaded {len(PRIVATE_KEYS)} private key(s)", flush=True)
 
-
 # =========================
 # Meta Flows Crypto
 # =========================
@@ -138,7 +137,6 @@ def decrypt_flow_payload_try_all_keys(body: dict):
     ciphertext_and_tag = b64d(body["encrypted_flow_data"])
 
     last_err = None
-
     for idx, key in enumerate(PRIVATE_KEYS, start=1):
         try:
             aes_key = key.decrypt(
@@ -158,6 +156,12 @@ def decrypt_flow_payload_try_all_keys(body: dict):
     raise ValueError(f"Decryption failed for all keys: {last_err}")
 
 
+def extract_flow_token(req: dict) -> str:
+    # Meta peut l'envoyer à plusieurs endroits selon le contexte
+    data = req.get("data") or {}
+    return (req.get("flow_token") or data.get("flow_token") or req.get("token") or "")
+
+
 # =========================
 # Basic routes
 # =========================
@@ -173,6 +177,8 @@ def health():
 
 # =========================
 # Flow endpoint (Meta Flows)
+# - Ici on gère ping + data_exchange
+# - On renvoie vers l'écran THANKS
 # =========================
 @app.get("/api/survey/webhook")
 def flow_get():
@@ -183,8 +189,6 @@ def flow_get():
 def flow_post():
     try:
         body = request.get_json(force=True, silent=False) or {}
-
-        # si ce n'est pas une requête Flows, répondre OK
         if not isinstance(body, dict) or not FLOW_REQUIRED_KEYS.issubset(set(body.keys())):
             return Response("OK", status=200, mimetype="text/plain")
 
@@ -193,7 +197,11 @@ def flow_post():
         action = req.get("action")
         version = req.get("version", "3.0")
 
+        flow_token = extract_flow_token(req)
+
         app.logger.info(f"[FLOW] action={action} using_key={key_idx}")
+        app.logger.info(f"[FLOW] flow_token={flow_token}")
+        app.logger.info(f"[FLOW] keys={list(req.keys())} data_keys={list((req.get('data') or {}).keys())}")
 
         # PING
         if action == "ping":
@@ -201,39 +209,13 @@ def flow_post():
             encrypted = encrypt_flow_response(resp_obj, aes_key, iv)
             return Response(encrypted, status=200, mimetype="text/plain")
 
-        # DATA_EXCHANGE : on enregistre + on navigue vers THANKS
+        # DATA_EXCHANGE -> go to THANKS screen
         if action == "data_exchange":
-            data = req.get("data") or {}
-
-            q1 = data.get("q1", "")
-            q2 = data.get("q2", "")
-            q3 = data.get("q3", "")
-            campaign_id = data.get("campaign_id", "")
-            segment = data.get("segment", "")
-
-            ts = now_iso()
-            raw_json = json.dumps(req, ensure_ascii=False)
-
-            # Phone non dispo ici (normal). On met vide.
-            phone = ""
-
-            # ✅ WRITE SHEET ICI (sinon tu reçois rien)
-            try:
-                append_row_to_sheet([ts, phone, "", campaign_id, segment, q1, q2, q3, raw_json])
-            except Exception as e:
-                app.logger.exception(f"[SHEETS] append_row failed: {e}")
-
-            # ✅ Aller vers THANKS + donner les data attendues par l'écran THANKS
             resp_obj = {
                 "version": version,
+                "flow_token": flow_token,   # safe (même si vide)
                 "screen": "THANKS",
-                "data": {
-                    "campaign_id": campaign_id,
-                    "segment": segment,
-                    "q1": q1,
-                    "q2": q2,
-                    "q3": q3
-                }
+                "data": {"ok": True},
             }
             encrypted = encrypt_flow_response(resp_obj, aes_key, iv)
             return Response(encrypted, status=200, mimetype="text/plain")
@@ -245,22 +227,24 @@ def flow_post():
 
     except Exception:
         app.logger.exception("[FLOW] Error")
-        # toujours 200 sinon WhatsApp affiche erreur
+        # Évite 400 sinon WhatsApp affiche souvent une erreur
         return Response("OK", status=200, mimetype="text/plain")
 
 
+# Alias optionnel
 @app.post("/webhook/flow")
 def flow_alias():
     return flow_post()
 
 
 # =========================
-# WhatsApp webhook (optional for phone)
-# ⚠️ Ne marchera que si tu as configuré Webhooks (messages) côté Meta
+# WhatsApp Webhook
+# - Ici on a le phone
+# - Et response_json (q1,q2,q3,campaign_id,segment...)
+# - On écrit dans le Sheet ici (car c'est là qu'on a le numéro)
 # =========================
 @app.get("/webhook/whatsapp")
 def whatsapp_get():
-    # Si tu veux faire la vraie vérification Webhook Meta, dis-moi ton VERIFY_TOKEN et je te donne le handler complet hub.challenge.
     return "OK", 200
 
 
@@ -289,8 +273,11 @@ def whatsapp_post():
             campaign_id = resp.get("campaign_id", "")
             segment = resp.get("segment", "")
 
+            # parfois flow_token peut aussi être injecté dans response_json
+            flow_token = resp.get("flow_token", "") or ""
+
             append_row_to_sheet([
-                ts, phone, "", campaign_id, segment, q1, q2, q3,
+                ts, phone, flow_token, campaign_id, segment, q1, q2, q3,
                 json.dumps(body, ensure_ascii=False)
             ])
             return jsonify({"ok": True}), 200
