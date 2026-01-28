@@ -173,8 +173,6 @@ def health():
 
 # =========================
 # Flow endpoint (Meta Flows)
-# IMPORTANT: This endpoint only returns screen THANKS.
-# Sheet writing is done in /webhook/whatsapp to get phone number.
 # =========================
 @app.get("/api/survey/webhook")
 def flow_get():
@@ -185,6 +183,8 @@ def flow_get():
 def flow_post():
     try:
         body = request.get_json(force=True, silent=False) or {}
+
+        # si ce n'est pas une requête Flows, répondre OK
         if not isinstance(body, dict) or not FLOW_REQUIRED_KEYS.issubset(set(body.keys())):
             return Response("OK", status=200, mimetype="text/plain")
 
@@ -201,14 +201,38 @@ def flow_post():
             encrypted = encrypt_flow_response(resp_obj, aes_key, iv)
             return Response(encrypted, status=200, mimetype="text/plain")
 
-        # DATA_EXCHANGE -> go to THANKS screen
+        # DATA_EXCHANGE : on enregistre + on navigue vers THANKS
         if action == "data_exchange":
-            # On répond en demandant explicitement d'aller vers l'écran THANKS
+            data = req.get("data") or {}
+
+            q1 = data.get("q1", "")
+            q2 = data.get("q2", "")
+            q3 = data.get("q3", "")
+            campaign_id = data.get("campaign_id", "")
+            segment = data.get("segment", "")
+
+            ts = now_iso()
+            raw_json = json.dumps(req, ensure_ascii=False)
+
+            # Phone non dispo ici (normal). On met vide.
+            phone = ""
+
+            # ✅ WRITE SHEET ICI (sinon tu reçois rien)
+            try:
+                append_row_to_sheet([ts, phone, "", campaign_id, segment, q1, q2, q3, raw_json])
+            except Exception as e:
+                app.logger.exception(f"[SHEETS] append_row failed: {e}")
+
+            # ✅ Aller vers THANKS + donner les data attendues par l'écran THANKS
             resp_obj = {
                 "version": version,
                 "screen": "THANKS",
                 "data": {
-                    "ok": True
+                    "campaign_id": campaign_id,
+                    "segment": segment,
+                    "q1": q1,
+                    "q2": q2,
+                    "q3": q3
                 }
             }
             encrypted = encrypt_flow_response(resp_obj, aes_key, iv)
@@ -221,21 +245,22 @@ def flow_post():
 
     except Exception:
         app.logger.exception("[FLOW] Error")
-        # Meta peut afficher une erreur si 400 -> donc on renvoie 200 "OK" si possible
+        # toujours 200 sinon WhatsApp affiche erreur
         return Response("OK", status=200, mimetype="text/plain")
 
 
-# Alias optionnel si tu veux
 @app.post("/webhook/flow")
 def flow_alias():
     return flow_post()
 
 
 # =========================
-# WhatsApp Webhook (gives phone + response_json)
+# WhatsApp webhook (optional for phone)
+# ⚠️ Ne marchera que si tu as configuré Webhooks (messages) côté Meta
 # =========================
 @app.get("/webhook/whatsapp")
 def whatsapp_get():
+    # Si tu veux faire la vraie vérification Webhook Meta, dis-moi ton VERIFY_TOKEN et je te donne le handler complet hub.challenge.
     return "OK", 200
 
 
