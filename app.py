@@ -250,7 +250,15 @@ def flow_endpoint():
             # on continue quand même à répondre OK à Meta pour ne pas bloquer l'utilisateur
 
 
-        resp_obj = {"version": version, "data": {"ok": True}}
+        resp_obj = {
+            "version": version,
+            "data": {
+                "status": "success",
+                "result": "ok"
+            }
+        }
+
+
         encrypted = encrypt_flow_response(resp_obj, aes_key, iv)
         return Response(encrypted, status=200, mimetype="text/plain")
 
