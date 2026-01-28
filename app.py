@@ -13,19 +13,9 @@ from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 app = Flask(__name__)
-APP_VERSION = "v2026-01-28-17-05"
-
 
 # ----------------------------
-# Meta requires BASE64 body
-# ----------------------------
-def base64_response(obj: dict) -> str:
-    raw = json.dumps(obj, ensure_ascii=False).encode("utf-8")
-    return base64.b64encode(raw).decode("utf-8")
-
-
-# ----------------------------
-# Google Sheets client
+# Google Sheets
 # ----------------------------
 def get_gspread_client():
     scopes = [
@@ -45,11 +35,9 @@ def get_gspread_client():
 
     return gspread.authorize(creds)
 
-
 def append_row_to_sheet(row):
     sheet_id = os.getenv("GSHEET_ID")
     tab_name = os.getenv("GSHEET_TAB", "Sheet1")
-
     if not sheet_id:
         raise RuntimeError("Missing GSHEET_ID env var")
 
@@ -58,41 +46,35 @@ def append_row_to_sheet(row):
     ws = sh.worksheet(tab_name)
     ws.append_row(row, value_input_option="RAW")
 
-
 # ----------------------------
 # Helpers
 # ----------------------------
 def now_iso():
     return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 
+def b64d(s: str) -> bytes:
+    s = (s or "").strip()
+    s += "=" * (-len(s) % 4)
+    try:
+        return base64.b64decode(s)
+    except Exception:
+        return base64.urlsafe_b64decode(s)
 
-def dig(d, *keys):
-    cur = d
-    for k in keys:
-        if isinstance(cur, dict) and k in cur:
-            cur = cur[k]
-        else:
-            return None
-    return cur
-
-
-def extract_from(body: dict) -> str:
-    return (
-        str(dig(body, "from") or "")
-        or str(dig(body, "sender") or "")
-        or str(dig(body, "contact", "phone") or "")
-        or str(dig(body, "message", "from") or "")
-        or ""
-    )
-
+def b64e(b: bytes) -> str:
+    return base64.b64encode(b).decode("utf-8")
 
 def load_private_key():
+    """
+    Use ONE:
+      - FLOW_PRIVATE_KEY_PEM  (recommended)
+      - FLOW_PRIVATE_KEY_FILE (path, default private_key.pem)
+    """
     passphrase = os.getenv("FLOW_PRIVATE_KEY_PASSPHRASE")
     password = passphrase.encode("utf-8") if passphrase else None
 
-    priv_pem_env = os.getenv("FLOW_PRIVATE_KEY_PEM")
-    if priv_pem_env:
-        return load_pem_private_key(priv_pem_env.encode("utf-8"), password=password)
+    pem_env = os.getenv("FLOW_PRIVATE_KEY_PEM")
+    if pem_env:
+        return load_pem_private_key(pem_env.encode("utf-8"), password=password)
 
     key_file = os.getenv("FLOW_PRIVATE_KEY_FILE", "private_key.pem")
     if not os.path.exists(key_file):
@@ -103,36 +85,23 @@ def load_private_key():
 
     return load_pem_private_key(pem_bytes, password=password)
 
-
-def b64d(s: str) -> bytes:
-    s = s.strip()
-    s += "=" * (-len(s) % 4)
-    try:
-        return base64.b64decode(s)
-    except Exception:
-        return base64.urlsafe_b64decode(s)
-
-
-def decrypt_encrypted_flow_data(body: dict) -> dict:
+def decrypt_flow(body: dict):
     """
-    Expect fields:
-      - encrypted_aes_key (base64 RSA-OAEP encrypted AES key)
-      - initial_vector (base64 IV/nonce)
-      - encrypted_flow_data (base64 AES-GCM ciphertext||tag)
+    Meta sends:
+      - encrypted_aes_key (base64) : RSA-OAEP encrypted AES key
+      - initial_vector (base64)   : iv/nonce
+      - encrypted_flow_data (base64): AES-GCM ciphertext||tag
     """
-    private_key = load_private_key()
-
     enc_key_b64 = body.get("encrypted_aes_key")
     iv_b64 = body.get("initial_vector")
     data_b64 = body.get("encrypted_flow_data")
-
     if not (enc_key_b64 and iv_b64 and data_b64):
         raise RuntimeError("Missing encrypted_aes_key / initial_vector / encrypted_flow_data")
 
-    # RSA decrypt AES key
-    enc_aes_key = b64d(enc_key_b64)
+    private_key = load_private_key()
+
     aes_key = private_key.decrypt(
-        enc_aes_key,
+        b64d(enc_key_b64),
         padding.OAEP(
             mgf=padding.MGF1(algorithm=hashes.SHA256()),
             algorithm=hashes.SHA256(),
@@ -140,98 +109,67 @@ def decrypt_encrypted_flow_data(body: dict) -> dict:
         ),
     )
 
-    # AES-GCM decrypt
     iv = b64d(iv_b64)
-    ciphertext_and_tag = b64d(data_b64)
-    plaintext = AESGCM(aes_key).decrypt(iv, ciphertext_and_tag, None)
+    ciphertext_tag = b64d(data_b64)
+
+    plaintext = AESGCM(aes_key).decrypt(iv, ciphertext_tag, None)
 
     try:
-        return json.loads(plaintext.decode("utf-8"))
+        payload = json.loads(plaintext.decode("utf-8"))
     except Exception:
-        return {"_decrypted_text": plaintext.decode("utf-8", errors="replace")}
+        payload = {"_decrypted_text": plaintext.decode("utf-8", errors="replace")}
 
+    return payload, aes_key, iv
 
-def extract_payload(body: dict) -> dict:
-    # If encrypted_flow_data exists → decrypt using full body
-    if body.get("encrypted_flow_data") and body.get("encrypted_aes_key") and body.get("initial_vector"):
-        return decrypt_encrypted_flow_data(body)
-
-    # fallback formats
-    candidates = [
-        body,
-        dig(body, "payload"),
-        dig(body, "flow"),
-        dig(body, "data"),
-        dig(body, "content"),
-        dig(body, "content", "data"),
-        dig(body, "message"),
-        dig(body, "message", "content"),
-        dig(body, "message", "content", "data"),
-        dig(body, "entry", 0, "changes", 0, "value"),
-    ]
-    for c in candidates:
-        if isinstance(c, dict):
-            return c
-    return {}
-
-
-# ----------------------------
-# Single handler
-# ----------------------------
-def handle_meta_webhook():
-    body = request.get_json(force=True, silent=True) or {}
-    payload = extract_payload(body)
-
-    phone = extract_from(body)
-    ts = now_iso()
-
-    # (selon ton Flow JSON, campaign_id/segment viennent de data)
-    campaign_id = payload.get("campaign_id") or dig(payload, "data", "campaign_id") or ""
-    segment = payload.get("segment") or dig(payload, "data", "segment") or payload.get("flow_token", "") or ""
-
-    q1 = payload.get("q1", "")
-    q2 = payload.get("q2", "")
-    q3 = payload.get("q3", "")
-
-    raw_json = json.dumps(payload if payload else body, ensure_ascii=False)
-
-    # ✅ Évite polluer le sheet avec ping / events
-    if q1 or q2 or q3:
-        row = [ts, phone, campaign_id, segment, q1, q2, q3, raw_json]
-        append_row_to_sheet(row)
-
-    # ✅ Meta expects BASE64 body
-    return base64_response({"ok": True}), 200
-
+def encrypt_response(aes_key: bytes, iv: bytes, obj: dict) -> str:
+    """
+    Meta expects: base64( AES-GCM(plaintext_json) ) as RAW TEXT response.
+    """
+    plaintext = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+    ciphertext_tag = AESGCM(aes_key).encrypt(iv, plaintext, None)
+    return b64e(ciphertext_tag)
 
 # ----------------------------
 # Routes
 # ----------------------------
-@app.post("/webhook")
-def webhook():
-    try:
-        return handle_meta_webhook()
-    except Exception:
-        app.logger.exception("Webhook error")
-        # ✅ Always BASE64, even on error
-        return base64_response({"ok": False}), 200
-
-
 @app.post("/api/survey/webhook")
-def webhook_api_survey():
-    return webhook()
-
-
+@app.post("/webhook")
 @app.post("/webhook/whatsapp")
-def webhook_whatsapp():
-    return webhook()
+def webhook():
+    body = request.get_json(force=True, silent=False) or {}
+    # On doit toujours renvoyer une réponse chiffrée si on reçoit un payload chiffré
+    try:
+        payload, aes_key, iv = decrypt_flow(body)
 
+        # ping / availability check
+        if payload.get("action") == "ping":
+            resp = {"version": payload.get("version", "3.0"), "action": "pong"}
+            return encrypt_response(aes_key, iv, resp), 200, {"Content-Type": "text/plain"}
+
+        # ----- ici ton extraction -----
+        ts = now_iso()
+        phone = str(payload.get("from") or payload.get("phone") or "")
+        campaign_id = payload.get("campaign_id", "")
+        segment = payload.get("segment", "") or payload.get("flow_token", "")
+
+        q1 = payload.get("q1", "")
+        q2 = payload.get("q2", "")
+        q3 = payload.get("q3", "")
+
+        raw_json = json.dumps(payload, ensure_ascii=False)
+        row = [ts, phone, campaign_id, segment, q1, q2, q3, raw_json]
+        append_row_to_sheet(row)
+
+        resp = {"ok": True}
+        return encrypt_response(aes_key, iv, resp), 200, {"Content-Type": "text/plain"}
+
+    except Exception as e:
+        # IMPORTANT: même en erreur, Meta veut souvent une réponse "valide" (sinon endpoint inactive)
+        # Si on n'a pas pu déchiffrer, on répond juste OK non chiffré (au moins 200)
+        print("WEBHOOK_ERROR:", str(e), flush=True)
+        return "OK", 200, {"Content-Type": "text/plain"}
 
 @app.get("/health")
-def health():
-    return json.dumps({"ok": True, "version": APP_VERSION}), 200
-
-
 @app.get("/")
-def root():
+def health():
     return "OK", 200
