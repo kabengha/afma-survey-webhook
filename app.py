@@ -73,10 +73,6 @@ def dig(d, *keys):
 
 
 def extract_phone_from_anywhere(obj: dict) -> str:
-    """
-    NB: Dans le payload Flow chiffré, le phone n’est pas toujours présent.
-    Donc on essaie, sinon vide => tu relies via flow_token.
-    """
     candidates = [
         dig(obj, "from"),
         dig(obj, "sender"),
@@ -112,10 +108,11 @@ def b64e(b: bytes) -> str:
 
 def load_private_key():
     """
-    Charge la clé privée depuis:
-      - FLOW_PRIVATE_KEY_PEM (env var)   [recommandé Render]
-      - ou FLOW_PRIVATE_KEY_FILE (path)
-    Si Render stocke la PEM en une ligne avec "\\n", on convertit.
+    Loads private key either from:
+      - FLOW_PRIVATE_KEY_PEM (env var)
+      - FLOW_PRIVATE_KEY_FILE (env var path) or default 'private_key.pem'
+    Render tip:
+      If env var contains literal "\\n", convert to "\n".
     """
     passphrase = os.getenv("FLOW_PRIVATE_KEY_PASSPHRASE")
     password = passphrase.encode("utf-8") if passphrase else None
@@ -149,15 +146,10 @@ def _init_key_once():
 # Meta Flows Crypto
 # ============================================================
 
-def decrypt_flow_payload(body: dict):
-    """
-    Attend les champs top-level:
-      - encrypted_flow_data (base64)
-      - encrypted_aes_key (base64)
-      - initial_vector (base64)
+FLOW_REQUIRED_KEYS = {"encrypted_flow_data", "encrypted_aes_key", "initial_vector"}
 
-    Retourne: (req_dict, aes_key_bytes, iv_bytes)
-    """
+
+def decrypt_flow_payload(body: dict):
     enc_key_b64 = body.get("encrypted_aes_key")
     iv_b64 = body.get("initial_vector")
     data_b64 = body.get("encrypted_flow_data")
@@ -186,14 +178,13 @@ def decrypt_flow_payload(body: dict):
 
 
 def invert_iv(iv: bytes) -> bytes:
-    # IV réponse = bitwise NOT de l’IV reçu
     return bytes((b ^ 0xFF) for b in iv)
 
 
 def encrypt_flow_response(resp_obj: dict, aes_key: bytes, req_iv: bytes) -> str:
     resp_iv = invert_iv(req_iv)
     resp_bytes = json.dumps(resp_obj, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-    ct = AESGCM(aes_key).encrypt(resp_iv, resp_bytes, None)  # ciphertext||tag
+    ct = AESGCM(aes_key).encrypt(resp_iv, resp_bytes, None)
     return b64e(ct)
 
 
@@ -216,16 +207,18 @@ def health():
 # ------------------------------------------------------------
 @app.post("/flow")
 def flow_endpoint():
-    """
-    IMPORTANT:
-    - La réponse DOIT être une STRING base64 chiffrée (pas JSON)
-    - Content-Type text/plain
-    - IV réponse = inverted IV reçu
-    """
     try:
         body = request.get_json(force=True, silent=False) or {}
+        ua = request.headers.get("User-Agent", "")
+        app.logger.info(f"[FLOW] UA={ua}")
         app.logger.info(f"[FLOW] RAW keys={list(body.keys()) if isinstance(body, dict) else type(body)}")
 
+        # 1) Hard validation: if it’s not a valid encrypted Flows request, reject
+        if not isinstance(body, dict) or not FLOW_REQUIRED_KEYS.issubset(set(body.keys())):
+            app.logger.warning("[FLOW] Missing encrypted fields -> not a valid Meta Flows request")
+            return Response("BAD REQUEST", status=400, mimetype="text/plain")
+
+        # 2) Decrypt
         req, aes_key, iv = decrypt_flow_payload(body)
 
         action = req.get("action")
@@ -242,7 +235,7 @@ def flow_endpoint():
         data = req.get("data") or {}
         flow_token = req.get("flow_token", "") or req.get("token", "")
 
-        # Champs réponses (adapte si tes keys sont différentes)
+        # Answers (adjust if your keys differ)
         q1 = data.get("q1", "") or data.get("Q1", "") or ""
         q2 = data.get("q2", "") or data.get("Q2", "") or ""
         q3 = data.get("q3", "") or data.get("Q3", "") or ""
@@ -255,25 +248,24 @@ def flow_endpoint():
         ts = now_iso()
         raw_json = json.dumps(req, ensure_ascii=False)
 
-        # IMPORTANT: on ne sauvegarde pas les pings, seulement les réponses user
+        # Save to Sheets (only for user responses, not ping)
         row = [ts, phone, flow_token, campaign_id, segment, q1, q2, q3, raw_json]
         append_row_to_sheet(row)
 
-        # ACK chiffré
+        # ACK encrypted
         resp_obj = {"version": version, "data": {"ok": True}}
         encrypted = encrypt_flow_response(resp_obj, aes_key, iv)
         return Response(encrypted, status=200, mimetype="text/plain")
 
     except Exception:
         app.logger.exception("[FLOW] Error")
-        # Si decrypt fail, ne surtout pas renvoyer une réponse en clair 200,
-        # sinon Meta dit "Impossible de décrypter la réponse"
+        # IMPORTANT: do NOT return 200 with plaintext, Meta would try to decrypt it
         return Response("ERROR", status=400, mimetype="text/plain")
 
 
 # ------------------------------------------------------------
-# ALIASES pour ton URL Meta actuelle
-# Meta = https://afma-survey-webhook.onrender.com/api/survey/webhook
+# Aliases for your Meta URL
+# Meta URL: https://afma-survey-webhook.onrender.com/api/survey/webhook
 # ------------------------------------------------------------
 @app.post("/api/survey/webhook")
 @app.post("/webhook/whatsapp")
@@ -283,7 +275,7 @@ def flow_alias():
 
 
 # ------------------------------------------------------------
-# Classic WhatsApp webhook (optionnel)
+# Classic WhatsApp webhook (optional)
 # ------------------------------------------------------------
 @app.post("/webhook")
 def webhook():
@@ -293,7 +285,6 @@ def webhook():
         ts = now_iso()
         raw_json = json.dumps(body, ensure_ascii=False)
 
-        # Log minimal
         row = [ts, phone, "", "", "", "", "", "", raw_json]
         append_row_to_sheet(row)
 
