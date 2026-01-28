@@ -22,7 +22,7 @@ def get_gspread_client():
         "https://www.googleapis.com/auth/drive",
     ]
 
-    sa_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+    sa_json = os.getenv("GOOGLE_SA_JSON")
     sa_file = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE")
 
     if sa_json:
@@ -36,8 +36,8 @@ def get_gspread_client():
     return gspread.authorize(creds)
 
 def append_row_to_sheet(row):
-    sheet_id = os.getenv("SHEET_ID")
-    tab_name = os.getenv("SHEET_TAB_NAME", "Sheet1")
+    sheet_id = os.getenv("GSHEET_ID")
+    tab_name = os.getenv("GSHEET_TAB", "Sheet1")
 
     if not sheet_id:
         raise RuntimeError("Missing SHEET_ID env var")
