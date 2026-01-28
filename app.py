@@ -3,7 +3,6 @@ import json
 import base64
 from datetime import datetime, timezone
 
-
 from flask import Flask, request, jsonify, Response
 
 import gspread
@@ -15,11 +14,16 @@ from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 import logging
-app.logger.setLevel(logging.INFO)
 
-
+logging.basicConfig(level=logging.INFO)
 
 app = Flask(__name__)
+
+
+
+@app.get("/api/survey/webhook")
+def flow_alias_get():
+    return "OK", 200
 
 # =========================
 # Google Sheets
@@ -131,15 +135,8 @@ def load_private_keys():
     return keys
 
 
-PRIVATE_KEYS = None
-
-
-@app.before_request
-def _init_keys_once():
-    global PRIVATE_KEYS
-    if PRIVATE_KEYS is None:
-        PRIVATE_KEYS = load_private_keys()
-        app.logger.info(f"[BOOT] Loaded {len(PRIVATE_KEYS)} private key(s)")
+PRIVATE_KEYS = load_private_keys()
+print(f"[BOOT] Loaded {len(PRIVATE_KEYS)} private key(s)", flush=True)
 
 
 # =========================
