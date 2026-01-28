@@ -3,7 +3,7 @@ import json
 import base64
 from datetime import datetime, timezone
 
-from flask import Flask, request, jsonify
+from flask import Flask, request
 import gspread
 from google.oauth2.service_account import Credentials
 
@@ -12,8 +12,17 @@ from cryptography.hazmat.primitives.serialization import load_pem_private_key
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-
 app = Flask(__name__)
+APP_VERSION = "v2026-01-28-17-05"
+
+
+# ----------------------------
+# Meta requires BASE64 body
+# ----------------------------
+def base64_response(obj: dict) -> str:
+    raw = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+    return base64.b64encode(raw).decode("utf-8")
+
 
 # ----------------------------
 # Google Sheets client
@@ -36,6 +45,7 @@ def get_gspread_client():
 
     return gspread.authorize(creds)
 
+
 def append_row_to_sheet(row):
     sheet_id = os.getenv("GSHEET_ID")
     tab_name = os.getenv("GSHEET_TAB", "Sheet1")
@@ -48,11 +58,13 @@ def append_row_to_sheet(row):
     ws = sh.worksheet(tab_name)
     ws.append_row(row, value_input_option="RAW")
 
+
 # ----------------------------
 # Helpers
 # ----------------------------
 def now_iso():
     return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+
 
 def dig(d, *keys):
     cur = d
@@ -63,6 +75,7 @@ def dig(d, *keys):
             return None
     return cur
 
+
 def extract_from(body: dict) -> str:
     return (
         str(dig(body, "from") or "")
@@ -72,12 +85,8 @@ def extract_from(body: dict) -> str:
         or ""
     )
 
+
 def load_private_key():
-    """
-    Loads private key either from:
-      - FLOW_PRIVATE_KEY_PEM (env var)
-      - FLOW_PRIVATE_KEY_FILE (env var path) or default 'private_key.pem'
-    """
     passphrase = os.getenv("FLOW_PRIVATE_KEY_PASSPHRASE")
     password = passphrase.encode("utf-8") if passphrase else None
 
@@ -94,8 +103,8 @@ def load_private_key():
 
     return load_pem_private_key(pem_bytes, password=password)
 
+
 def b64d(s: str) -> bytes:
-    # base64 standard / urlsafe + padding auto
     s = s.strip()
     s += "=" * (-len(s) % 4)
     try:
@@ -103,12 +112,13 @@ def b64d(s: str) -> bytes:
     except Exception:
         return base64.urlsafe_b64decode(s)
 
+
 def decrypt_encrypted_flow_data(body: dict) -> dict:
     """
-    Decrypt Meta/Infobip flow payload when fields are:
+    Expect fields:
       - encrypted_aes_key (base64 RSA-OAEP encrypted AES key)
       - initial_vector (base64 IV/nonce)
-      - encrypted_flow_data (base64 AES-GCM ciphertext (often includes tag at end))
+      - encrypted_flow_data (base64 AES-GCM ciphertext||tag)
     """
     private_key = load_private_key()
 
@@ -119,7 +129,7 @@ def decrypt_encrypted_flow_data(body: dict) -> dict:
     if not (enc_key_b64 and iv_b64 and data_b64):
         raise RuntimeError("Missing encrypted_aes_key / initial_vector / encrypted_flow_data")
 
-    # 1) RSA decrypt AES key
+    # RSA decrypt AES key
     enc_aes_key = b64d(enc_key_b64)
     aes_key = private_key.decrypt(
         enc_aes_key,
@@ -130,42 +140,23 @@ def decrypt_encrypted_flow_data(body: dict) -> dict:
         ),
     )
 
-    # 2) AES-GCM decrypt
+    # AES-GCM decrypt
     iv = b64d(iv_b64)
     ciphertext_and_tag = b64d(data_b64)
-
-    # IMPORTANT:
-    # AESGCM.decrypt expects ciphertext||tag (tag is last 16 bytes) — Meta usually sends that combined.
     plaintext = AESGCM(aes_key).decrypt(iv, ciphertext_and_tag, None)
 
-    # 3) JSON output
     try:
         return json.loads(plaintext.decode("utf-8"))
     except Exception:
         return {"_decrypted_text": plaintext.decode("utf-8", errors="replace")}
 
 
-
 def extract_payload(body: dict) -> dict:
-    # 1) If encrypted_flow_data exists, try decrypt it (but NEVER crash)
-    enc = (
-        body.get("encrypted_flow_data")
-        or dig(body, "payload", "encrypted_flow_data")
-        or dig(body, "data", "encrypted_flow_data")
-    )
+    # If encrypted_flow_data exists → decrypt using full body
+    if body.get("encrypted_flow_data") and body.get("encrypted_aes_key") and body.get("initial_vector"):
+        return decrypt_encrypted_flow_data(body)
 
-    if enc:
-        try:
-            clear = decrypt_encrypted_flow_data(body)  # <-- pass body, not enc
-            return clear if isinstance(clear, dict) else {"_decrypted": clear}
-        except Exception as e:
-            return {
-                "_decrypt_error": str(e),
-                "encrypted_flow_data": enc
-            }
-
-
-    # 2) Fallback: non-encrypted formats
+    # fallback formats
     candidates = [
         body,
         dig(body, "payload"),
@@ -179,76 +170,68 @@ def extract_payload(body: dict) -> dict:
         dig(body, "entry", 0, "changes", 0, "value"),
     ]
     for c in candidates:
-        if isinstance(c, dict) and any(k in c for k in ["q1", "q2", "q3", "campaign_id", "segment", "flow_token"]):
+        if isinstance(c, dict):
             return c
-
     return {}
 
 
-@app.post("/webhook")
-def webhook():
-    try:
-        body = request.get_json(force=True, silent=False) or {}
-        print("RAW_BODY_KEYS=", list(body.keys()) if isinstance(body, dict) else type(body), flush=True)
+# ----------------------------
+# Single handler
+# ----------------------------
+def handle_meta_webhook():
+    body = request.get_json(force=True, silent=True) or {}
+    payload = extract_payload(body)
 
+    phone = extract_from(body)
+    ts = now_iso()
 
-        # Debug: show if encrypted payload
-        if isinstance(body, dict) and "encrypted_flow_data" in body:
-            print("INCOMING encrypted_flow_data detected", flush=True)
+    # (selon ton Flow JSON, campaign_id/segment viennent de data)
+    campaign_id = payload.get("campaign_id") or dig(payload, "data", "campaign_id") or ""
+    segment = payload.get("segment") or dig(payload, "data", "segment") or payload.get("flow_token", "") or ""
 
-        payload = extract_payload(body)
-        print("DECRYPTED_PAYLOAD_KEYS=", list(payload.keys()) if isinstance(payload, dict) else type(payload), flush=True)
+    q1 = payload.get("q1", "")
+    q2 = payload.get("q2", "")
+    q3 = payload.get("q3", "")
 
+    raw_json = json.dumps(payload if payload else body, ensure_ascii=False)
 
-        phone = extract_from(body)
-        ts = now_iso()
-
-        campaign_id = payload.get("campaign_id") or dig(payload, "data", "campaign_id") or ""
-        segment = payload.get("segment") or dig(payload, "data", "segment") or payload.get("flow_token", "") or ""
-
-        q1 = payload.get("q1", "")
-        q2 = payload.get("q2", "")
-        q3 = payload.get("q3", "")
-
-        raw_json = json.dumps(payload if payload else body, ensure_ascii=False)
-
+    # ✅ Évite polluer le sheet avec ping / events
+    if q1 or q2 or q3:
         row = [ts, phone, campaign_id, segment, q1, q2, q3, raw_json]
         append_row_to_sheet(row)
 
-        return jsonify({"ok": True}), 200
+    # ✅ Meta expects BASE64 body
+    return base64_response({"ok": True}), 200
 
-    except Exception as e:
+
+# ----------------------------
+# Routes
+# ----------------------------
+@app.post("/webhook")
+def webhook():
+    try:
+        return handle_meta_webhook()
+    except Exception:
         app.logger.exception("Webhook error")
-        # Return 200 to keep endpoint availability OK (Meta won't mark you down)
-        return jsonify({"ok": False, "error": str(e)}), 200
+        # ✅ Always BASE64, even on error
+        return base64_response({"ok": False}), 200
 
-
-# Aliases to match callers
-@app.post("/webhook/whatsapp")
-def webhook_whatsapp():
-    return webhook()
 
 @app.post("/api/survey/webhook")
 def webhook_api_survey():
     return webhook()
 
+
+@app.post("/webhook/whatsapp")
+def webhook_whatsapp():
+    return webhook()
+
+
 @app.get("/health")
 def health():
-    return "OK", 200
+    return json.dumps({"ok": True, "version": APP_VERSION}), 200
+
 
 @app.get("/")
 def root():
     return "OK", 200
-
-@app.get("/api/survey/webhook")
-def webhook_get_api():
-    return "OK", 200
-
-@app.get("/webhook/whatsapp")
-def webhook_get_whatsapp():
-    return "OK", 200
-
-@app.get("/webhook")
-def webhook_get():
-    return "OK", 200
-
