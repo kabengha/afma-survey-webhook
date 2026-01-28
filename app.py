@@ -3,7 +3,8 @@ import json
 import base64
 from datetime import datetime, timezone
 
-from flask import Flask, request
+from flask import Flask, request, jsonify, Response
+
 import gspread
 from google.oauth2.service_account import Credentials
 
@@ -12,18 +13,20 @@ from cryptography.hazmat.primitives.serialization import load_pem_private_key
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
+
 app = Flask(__name__)
 
-# ----------------------------
+# ============================================================
 # Google Sheets
-# ----------------------------
+# ============================================================
+
 def get_gspread_client():
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
     ]
-    sa_json = os.getenv("GOOGLE_SA_JSON")
-    sa_file = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE")
+    sa_json = os.getenv("GOOGLE_SA_JSON")  # JSON string
+    sa_file = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE")  # file path
 
     if sa_json:
         info = json.loads(sa_json)
@@ -35,9 +38,11 @@ def get_gspread_client():
 
     return gspread.authorize(creds)
 
+
 def append_row_to_sheet(row):
     sheet_id = os.getenv("GSHEET_ID")
     tab_name = os.getenv("GSHEET_TAB", "Sheet1")
+
     if not sheet_id:
         raise RuntimeError("Missing GSHEET_ID env var")
 
@@ -46,11 +51,47 @@ def append_row_to_sheet(row):
     ws = sh.worksheet(tab_name)
     ws.append_row(row, value_input_option="RAW")
 
-# ----------------------------
-# Helpers
-# ----------------------------
+
+# ============================================================
+# Utils
+# ============================================================
+
 def now_iso():
     return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+
+
+def dig(d, *keys):
+    cur = d
+    for k in keys:
+        if isinstance(cur, dict) and k in cur:
+            cur = cur[k]
+        elif isinstance(cur, list) and isinstance(k, int) and 0 <= k < len(cur):
+            cur = cur[k]
+        else:
+            return None
+    return cur
+
+
+def extract_phone_from_anywhere(obj: dict) -> str:
+    """
+    Essaie d’extraire un numéro depuis différents formats possibles.
+    NB: Dans Flow encrypted payload, ce champ peut ne pas exister.
+    """
+    candidates = [
+        dig(obj, "from"),
+        dig(obj, "sender"),
+        dig(obj, "contact", "phone"),
+        dig(obj, "message", "from"),
+        dig(obj, "contacts", 0, "wa_id"),
+        dig(obj, "messages", 0, "from"),
+        dig(obj, "entry", 0, "changes", 0, "value", "messages", 0, "from"),
+        dig(obj, "entry", 0, "changes", 0, "value", "contacts", 0, "wa_id"),
+    ]
+    for c in candidates:
+        if c:
+            return str(c)
+    return ""
+
 
 def b64d(s: str) -> bytes:
     s = (s or "").strip()
@@ -60,21 +101,30 @@ def b64d(s: str) -> bytes:
     except Exception:
         return base64.urlsafe_b64decode(s)
 
+
 def b64e(b: bytes) -> str:
     return base64.b64encode(b).decode("utf-8")
 
+
+# ============================================================
+# RSA key loading
+# ============================================================
+
 def load_private_key():
     """
-    Use ONE:
-      - FLOW_PRIVATE_KEY_PEM  (recommended)
-      - FLOW_PRIVATE_KEY_FILE (path, default private_key.pem)
+    Loads private key either from:
+      - FLOW_PRIVATE_KEY_PEM (env var)
+      - FLOW_PRIVATE_KEY_FILE (env var path) or default 'private_key.pem'
+    Render tip:
+      If env var contains literal "\\n", convert to "\n".
     """
     passphrase = os.getenv("FLOW_PRIVATE_KEY_PASSPHRASE")
     password = passphrase.encode("utf-8") if passphrase else None
 
-    pem_env = os.getenv("FLOW_PRIVATE_KEY_PEM")
-    if pem_env:
-        return load_pem_private_key(pem_env.encode("utf-8"), password=password)
+    priv_pem_env = os.getenv("FLOW_PRIVATE_KEY_PEM")
+    if priv_pem_env:
+        pem = priv_pem_env.replace("\\n", "\n").encode("utf-8")
+        return load_pem_private_key(pem, password=password)
 
     key_file = os.getenv("FLOW_PRIVATE_KEY_FILE", "private_key.pem")
     if not os.path.exists(key_file):
@@ -85,23 +135,44 @@ def load_private_key():
 
     return load_pem_private_key(pem_bytes, password=password)
 
-def decrypt_flow(body: dict):
+
+PRIVATE_KEY = None
+
+
+@app.before_request
+def _init_key_once():
     """
-    Meta sends:
-      - encrypted_aes_key (base64) : RSA-OAEP encrypted AES key
-      - initial_vector (base64)   : iv/nonce
-      - encrypted_flow_data (base64): AES-GCM ciphertext||tag
+    Charge la clé une fois au démarrage (lazy).
+    """
+    global PRIVATE_KEY
+    if PRIVATE_KEY is None:
+        PRIVATE_KEY = load_private_key()
+
+
+# ============================================================
+# Meta Flows Crypto (decrypt + encrypt response)
+# ============================================================
+
+def decrypt_flow_payload(body: dict):
+    """
+    Input fields (top-level):
+      - encrypted_flow_data (base64)
+      - encrypted_aes_key (base64)
+      - initial_vector (base64)
+
+    Returns:
+      (req_dict, aes_key_bytes, iv_bytes)
     """
     enc_key_b64 = body.get("encrypted_aes_key")
     iv_b64 = body.get("initial_vector")
     data_b64 = body.get("encrypted_flow_data")
+
     if not (enc_key_b64 and iv_b64 and data_b64):
         raise RuntimeError("Missing encrypted_aes_key / initial_vector / encrypted_flow_data")
 
-    private_key = load_private_key()
-
-    aes_key = private_key.decrypt(
-        b64d(enc_key_b64),
+    enc_aes_key = b64d(enc_key_b64)
+    aes_key = PRIVATE_KEY.decrypt(
+        enc_aes_key,
         padding.OAEP(
             mgf=padding.MGF1(algorithm=hashes.SHA256()),
             algorithm=hashes.SHA256(),
@@ -110,66 +181,139 @@ def decrypt_flow(body: dict):
     )
 
     iv = b64d(iv_b64)
-    ciphertext_tag = b64d(data_b64)
+    ciphertext_and_tag = b64d(data_b64)
 
-    plaintext = AESGCM(aes_key).decrypt(iv, ciphertext_tag, None)
+    plaintext = AESGCM(aes_key).decrypt(iv, ciphertext_and_tag, None)
+    req = json.loads(plaintext.decode("utf-8"))
+    return req, aes_key, iv
 
-    try:
-        payload = json.loads(plaintext.decode("utf-8"))
-    except Exception:
-        payload = {"_decrypted_text": plaintext.decode("utf-8", errors="replace")}
 
-    return payload, aes_key, iv
+def invert_iv(iv: bytes) -> bytes:
+    # IV response = bitwise NOT of request IV
+    return bytes((b ^ 0xFF) for b in iv)
 
-def encrypt_response(aes_key: bytes, iv: bytes, obj: dict) -> str:
-    """
-    Meta expects: base64( AES-GCM(plaintext_json) ) as RAW TEXT response.
-    """
-    plaintext = json.dumps(obj, ensure_ascii=False).encode("utf-8")
-    ciphertext_tag = AESGCM(aes_key).encrypt(iv, plaintext, None)
-    return b64e(ciphertext_tag)
 
-# ----------------------------
+def encrypt_flow_response(resp_obj: dict, aes_key: bytes, req_iv: bytes) -> str:
+    resp_iv = invert_iv(req_iv)
+    resp_bytes = json.dumps(resp_obj, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    ct = AESGCM(aes_key).encrypt(resp_iv, resp_bytes, None)  # ciphertext||tag
+    return b64e(ct)
+
+
+# ============================================================
 # Routes
-# ----------------------------
-@app.post("/api/survey/webhook")
-@app.post("/webhook")
-@app.post("/webhook/whatsapp")
-def webhook():
-    body = request.get_json(force=True, silent=False) or {}
-    # On doit toujours renvoyer une réponse chiffrée si on reçoit un payload chiffré
-    try:
-        payload, aes_key, iv = decrypt_flow(body)
+# ============================================================
 
-        # ping / availability check
-        if payload.get("action") == "ping":
-            resp = {"version": payload.get("version", "3.0"), "action": "pong"}
-            return encrypt_response(aes_key, iv, resp), 200, {"Content-Type": "text/plain"}
+@app.get("/")
+def root():
+    return "OK", 200
 
-        # ----- ici ton extraction -----
-        ts = now_iso()
-        phone = str(payload.get("from") or payload.get("phone") or "")
-        campaign_id = payload.get("campaign_id", "")
-        segment = payload.get("segment", "") or payload.get("flow_token", "")
-
-        q1 = payload.get("q1", "")
-        q2 = payload.get("q2", "")
-        q3 = payload.get("q3", "")
-
-        raw_json = json.dumps(payload, ensure_ascii=False)
-        row = [ts, phone, campaign_id, segment, q1, q2, q3, raw_json]
-        append_row_to_sheet(row)
-
-        resp = {"ok": True}
-        return encrypt_response(aes_key, iv, resp), 200, {"Content-Type": "text/plain"}
-
-    except Exception as e:
-        # IMPORTANT: même en erreur, Meta veut souvent une réponse "valide" (sinon endpoint inactive)
-        # Si on n'a pas pu déchiffrer, on répond juste OK non chiffré (au moins 200)
-        print("WEBHOOK_ERROR:", str(e), flush=True)
-        return "OK", 200, {"Content-Type": "text/plain"}
 
 @app.get("/health")
-@app.get("/")
 def health():
     return "OK", 200
+
+
+# ------------------------------------------------------------
+# 1) Encrypted WhatsApp Flows endpoint (Meta endpoint availability)
+# ------------------------------------------------------------
+@app.post("/flow")
+def flow_endpoint():
+    """
+    This endpoint MUST return encrypted base64 string (text/plain),
+    otherwise Meta endpoint status will show "Unable to decrypt response".
+    """
+    try:
+        body = request.get_json(force=True, silent=False) or {}
+
+        # Debug minimal
+        app.logger.info(f"/flow RAW keys: {list(body.keys()) if isinstance(body, dict) else type(body)}")
+
+        # Decrypt
+        req, aes_key, iv = decrypt_flow_payload(body)
+
+        action = req.get("action")
+        version = req.get("version", "3.0")
+
+        # -------------------------
+        # A) PING (availability check)
+        # -------------------------
+        if action == "ping":
+            resp_obj = {"version": version, "data": {"status": "active"}}
+            encrypted = encrypt_flow_response(resp_obj, aes_key, iv)
+            return Response(encrypted, status=200, mimetype="text/plain")
+
+        # -------------------------
+        # B) DATA / SUBMIT
+        # -------------------------
+        # Typical structure: { action, version, screen, data, flow_token, ... }
+        data = req.get("data") or {}
+        flow_token = req.get("flow_token", "") or req.get("token", "")
+
+        # Answers (adapt to your real field names)
+        q1 = data.get("q1", "") or data.get("Q1", "") or ""
+        q2 = data.get("q2", "") or data.get("Q2", "") or ""
+        q3 = data.get("q3", "") or data.get("Q3", "") or ""
+
+        campaign_id = data.get("campaign_id", "") or ""
+        segment = data.get("segment", "") or ""
+
+        # Phone may not exist in decrypted req => keep empty, rely on mapping by flow_token
+        phone = extract_phone_from_anywhere(req)
+
+        ts = now_iso()
+        raw_json = json.dumps(req, ensure_ascii=False)
+
+        # Store to Sheets
+        row = [ts, phone, flow_token, campaign_id, segment, q1, q2, q3, raw_json]
+        append_row_to_sheet(row)
+
+        # ACK response (encrypted)
+        resp_obj = {"version": version, "data": {"ok": True}}
+        encrypted = encrypt_flow_response(resp_obj, aes_key, iv)
+        return Response(encrypted, status=200, mimetype="text/plain")
+
+    except Exception as e:
+        app.logger.exception("Flow endpoint error")
+        # If decrypt fails we can't encrypt a proper response; still return 200 to avoid retries storm
+        return Response("OK", status=200, mimetype="text/plain")
+
+
+# ------------------------------------------------------------
+# 2) Classic WhatsApp webhook endpoint (optional)
+#    (This is NOT the encrypted flow endpoint)
+# ------------------------------------------------------------
+@app.post("/webhook")
+def webhook():
+    """
+    Use this for normal WhatsApp Cloud API webhooks.
+    Do NOT use this as your Flows encrypted endpoint.
+    """
+    try:
+        body = request.get_json(force=True, silent=False) or {}
+        phone = extract_phone_from_anywhere(body)
+        ts = now_iso()
+
+        # Example: log everything (optional)
+        raw_json = json.dumps(body, ensure_ascii=False)
+
+        row = [ts, phone, "", "", "", "", "", "", raw_json]
+        append_row_to_sheet(row)
+
+        return jsonify({"ok": True}), 200
+
+    except Exception as e:
+        app.logger.exception("Webhook error")
+        return jsonify({"ok": False, "error": str(e)}), 200
+
+
+# ------------------------------------------------------------
+# GET endpoints for verification (if you need them)
+# ------------------------------------------------------------
+@app.get("/webhook")
+def webhook_get():
+    return "OK", 200
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
