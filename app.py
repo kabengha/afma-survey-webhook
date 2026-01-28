@@ -14,8 +14,8 @@ from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 import logging
-
 logging.basicConfig(level=logging.INFO)
+
 app = Flask(__name__)
 
 # =========================
@@ -85,7 +85,7 @@ def b64e(b: bytes) -> str:
 
 
 # =========================
-# Load private keys (support multi)
+# Load private keys (Flows)
 # =========================
 def _load_one_key_from_pem(pem_str: str):
     passphrase = os.getenv("FLOW_PRIVATE_KEY_PASSPHRASE")
@@ -114,13 +114,16 @@ def load_private_keys():
 PRIVATE_KEYS = load_private_keys()
 print(f"[BOOT] Loaded {len(PRIVATE_KEYS)} private key(s)", flush=True)
 
+
 # =========================
 # Meta Flows Crypto
 # =========================
 FLOW_REQUIRED_KEYS = {"encrypted_flow_data", "encrypted_aes_key", "initial_vector"}
 
+
 def invert_iv(iv: bytes) -> bytes:
     return bytes((b ^ 0xFF) for b in iv)
+
 
 def encrypt_flow_response(resp_obj: dict, aes_key: bytes, req_iv: bytes) -> str:
     resp_iv = invert_iv(req_iv)
@@ -128,12 +131,14 @@ def encrypt_flow_response(resp_obj: dict, aes_key: bytes, req_iv: bytes) -> str:
     ct = AESGCM(aes_key).encrypt(resp_iv, resp_bytes, None)
     return b64e(ct)
 
+
 def decrypt_flow_payload_try_all_keys(body: dict):
     enc_aes_key = b64d(body["encrypted_aes_key"])
     iv = b64d(body["initial_vector"])
     ciphertext_and_tag = b64d(body["encrypted_flow_data"])
 
     last_err = None
+
     for idx, key in enumerate(PRIVATE_KEYS, start=1):
         try:
             aes_key = key.decrypt(
@@ -152,44 +157,43 @@ def decrypt_flow_payload_try_all_keys(body: dict):
 
     raise ValueError(f"Decryption failed for all keys: {last_err}")
 
+
 # =========================
-# Routes
+# Basic routes
 # =========================
 @app.get("/")
 def root():
     return "OK", 200
 
+
 @app.get("/health")
 def health():
     return "OK", 200
 
-# GET “status check” pour Meta UI
+
+# =========================
+# Flow endpoint (Meta Flows)
+# IMPORTANT: This endpoint only returns screen THANKS.
+# Sheet writing is done in /webhook/whatsapp to get phone number.
+# =========================
 @app.get("/api/survey/webhook")
-def flow_get_status():
+def flow_get():
     return "OK", 200
 
-# POST Flow endpoint (Meta Flows)
+
 @app.post("/api/survey/webhook")
 def flow_post():
     try:
-        ua = request.headers.get("User-Agent", "")
         body = request.get_json(force=True, silent=False) or {}
-
-        app.logger.info(f"[FLOW] HIT path={request.path} ua={ua}")
-        app.logger.info(f"[FLOW] RAW keys={list(body.keys()) if isinstance(body, dict) else type(body)}")
-
         if not isinstance(body, dict) or not FLOW_REQUIRED_KEYS.issubset(set(body.keys())):
-            app.logger.warning("[FLOW] Not a valid encrypted Flow payload -> returning OK")
             return Response("OK", status=200, mimetype="text/plain")
 
         req, aes_key, iv, key_idx = decrypt_flow_payload_try_all_keys(body)
 
         action = req.get("action")
         version = req.get("version", "3.0")
-        data = req.get("data") or {}
-        flow_token = req.get("flow_token", "") or req.get("token", "")
 
-        app.logger.info(f"[FLOW] DECRYPTED action={action} using_key={key_idx} data_keys={list(data.keys())}")
+        app.logger.info(f"[FLOW] action={action} using_key={key_idx}")
 
         # PING
         if action == "ping":
@@ -197,58 +201,49 @@ def flow_post():
             encrypted = encrypt_flow_response(resp_obj, aes_key, iv)
             return Response(encrypted, status=200, mimetype="text/plain")
 
-        # DATA EXCHANGE / COMPLETE
-        q1 = data.get("q1", "")
-        q2 = data.get("q2", "")
-        q3 = data.get("q3", "")
-        campaign_id = data.get("campaign_id", "")
-        segment = data.get("segment", "")
+        # DATA_EXCHANGE -> go to THANKS screen
+        if action == "data_exchange":
+            # On répond en demandant explicitement d'aller vers l'écran THANKS
+            resp_obj = {
+                "version": version,
+                "screen": "THANKS",
+                "data": {
+                    "ok": True
+                }
+            }
+            encrypted = encrypt_flow_response(resp_obj, aes_key, iv)
+            return Response(encrypted, status=200, mimetype="text/plain")
 
-        ts = now_iso()
-        raw_json = json.dumps(req, ensure_ascii=False)
-
-        # phone rarement dispo dans Flow payload
-        phone = (
-            data.get("from", "")
-            or dig(req, "from")
-            or ""
-        )
-
-        app.logger.info(f"[SHEETS] FLOW writing ts={ts} segment={segment} q1={q1} q2={q2} q3={q3}")
-
-        try:
-            append_row_to_sheet([ts, phone, flow_token, campaign_id, segment, q1, q2, q3, raw_json])
-        except Exception:
-            app.logger.exception("[SHEETS] append_row failed (FLOW)")
-            # on répond quand même à Meta pour éviter l’erreur user
-
-        # ✅ réponse Flow : le minimum fiable
-        resp_obj = {
-            "version": version,
-            "data": {"ok": True}
-        }
+        # fallback safe
+        resp_obj = {"version": version, "data": {"ok": True}}
         encrypted = encrypt_flow_response(resp_obj, aes_key, iv)
         return Response(encrypted, status=200, mimetype="text/plain")
 
     except Exception:
         app.logger.exception("[FLOW] Error")
-        return Response("ERROR", status=400, mimetype="text/plain")
+        # Meta peut afficher une erreur si 400 -> donc on renvoie 200 "OK" si possible
+        return Response("OK", status=200, mimetype="text/plain")
 
 
-# WhatsApp Cloud webhook (si Meta envoie nfm_reply ici)
+# Alias optionnel si tu veux
+@app.post("/webhook/flow")
+def flow_alias():
+    return flow_post()
+
+
+# =========================
+# WhatsApp Webhook (gives phone + response_json)
+# =========================
 @app.get("/webhook/whatsapp")
-def waba_get():
+def whatsapp_get():
     return "OK", 200
 
+
 @app.post("/webhook/whatsapp")
-def waba_post():
+def whatsapp_post():
     try:
         body = request.get_json(force=True, silent=False) or {}
         ts = now_iso()
-
-        app.logger.info("[WABA] webhook hit")
-        # log partiel pour debug (évite log trop long)
-        app.logger.info(json.dumps(body, ensure_ascii=False)[:1500])
 
         msg = dig(body, "entry", 0, "changes", 0, "value", "messages", 0) or {}
         phone = msg.get("from", "")
@@ -269,26 +264,19 @@ def waba_post():
             campaign_id = resp.get("campaign_id", "")
             segment = resp.get("segment", "")
 
-            app.logger.info(f"[SHEETS] WABA writing ts={ts} phone={phone} segment={segment} q1={q1} q2={q2} q3={q3}")
-
-            try:
-                append_row_to_sheet([ts, phone, "", campaign_id, segment, q1, q2, q3, json.dumps(body, ensure_ascii=False)])
-            except Exception:
-                app.logger.exception("[SHEETS] append_row failed (WABA)")
-
+            append_row_to_sheet([
+                ts, phone, "", campaign_id, segment, q1, q2, q3,
+                json.dumps(body, ensure_ascii=False)
+            ])
             return jsonify({"ok": True}), 200
 
-        # sinon: log brut
-        try:
-            append_row_to_sheet([ts, phone, "", "", "", "", "", "", json.dumps(body, ensure_ascii=False)])
-        except Exception:
-            app.logger.exception("[SHEETS] append_row failed (WABA raw)")
-
+        # sinon log brut
+        append_row_to_sheet([ts, phone, "", "", "", "", "", "", json.dumps(body, ensure_ascii=False)])
         return jsonify({"ok": True}), 200
 
-    except Exception:
+    except Exception as e:
         app.logger.exception("[WABA] Error")
-        return jsonify({"ok": True}), 200
+        return jsonify({"ok": False, "error": str(e)}), 200
 
 
 if __name__ == "__main__":
